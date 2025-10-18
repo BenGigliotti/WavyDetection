@@ -5,7 +5,7 @@
 
 import os, csv, math, random, subprocess
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, OptionMenu
 from datetime import datetime
 import numpy as np, pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -14,6 +14,7 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
+import pickle
 
 APP_TITLE   = "Wavy Detection Prototype Dashboard"
 APP_VERSION = "v0.4 (history+needle+class overlays)"
@@ -163,14 +164,14 @@ class DataStore:
         self.sec_vals = []    # list[float]
         self.paired_df = None # pandas DataFrame with columns ["od","sec","t"]
 
+        self.model = None
+
 
     def _read_any_table(self, path: str):
         """Return a pandas DataFrame from CSV/XLS/XLSX (first sheet for Excel)."""
         ext = os.path.splitext(path.lower())[1]
         if ext in [".xlsx", ".xls"]:
-            return pd.read_excel(path, sheet_name=0)
-        else:
-            return pd.read_csv(path)
+            return pd.read_excel(path, sheet_name=None, parse_dates=[0])
         
     def _smart_to_numeric(self, series: pd.Series) -> pd.Series:
         """
@@ -239,6 +240,24 @@ class DataStore:
         except Exception:
             pass
         return c
+    
+    def filter_by_speed(self, df_dict):
+        speed_df = df_dict['YS_Pullout1_Act_Speed_fpm']
+        
+        speed_threshold = 1
+
+        mask = speed_df['Tag_value'] > speed_threshold
+        filtered_speed = speed_df[mask]
+        valid_indices = filtered_speed.index
+        
+        filtered_dict = {}
+        for sheet_name, df in df_dict.items():
+            if len(df) == 0:
+                continue
+                
+            filtered_dict[sheet_name] = df.reindex(valid_indices).reset_index(drop=True)
+        
+        return filtered_dict
 
     def load_data(self, path: str):
         """Load time-series data from CSV/XLSX with robust time/OD detection."""
@@ -247,105 +266,30 @@ class DataStore:
         
         self.path = path
 
-        df = self._read_any_table(path)
-        if df is None or df.empty:
+        df_dict = self._read_any_table(path)
+        if df_dict is None or len(df_dict) == 0:
             raise ValueError("Empty file.")
+        
+        filtered_df_dict = self.filter_by_speed(df_dict)
 
-        cols = list(df.columns)
-        if not cols:
-            raise ValueError("No columns found.")
-
-        # --- Pick time column (prefer known names, e.g., t_stamp) ---
-        tcol = pick(cols, DATA_COL_GUESSES["time"]) or cols[0]
-
-        # --- Pick OD column ---
-        # 1) Try your previously preferred exact header (if you set one)
-        EXACT_OD_COLUMN = globals().get("EXACT_OD_COLUMN", None)
-        ENFORCE_EXACT_OD = globals().get("ENFORCE_EXACT_OD", False)
-
-        ycol = None
-        if EXACT_OD_COLUMN and EXACT_OD_COLUMN in df.columns:
-            ycol = EXACT_OD_COLUMN
-        else:
-            # 2) Try alias list (includes Tag_value)
-            ycol = pick(cols, DATA_COL_GUESSES["od"])
-
-            # 3) If still unknown: choose the first numeric column that isn't the time column
-            if ycol is None:
-                for c in cols:
-                    if c != tcol and pd.api.types.is_numeric_dtype(df[c]):
-                        ycol = c
-                        break
-
-            # 4) If still unknown and there are only 2 columns, pick the other one
-            if ycol is None and len(cols) == 2:
-                ycol = cols[0] if cols[1] == tcol else cols[1]
-
-            # If user insisted on exact name and we failed, raise a friendly error
-            if ENFORCE_EXACT_OD and EXACT_OD_COLUMN and ycol != EXACT_OD_COLUMN:
-                raise ValueError(
-                    f"Could not find OD column '{EXACT_OD_COLUMN}' in this file.\n"
-                    f"Columns present: {list(df.columns)}\n"
-                    f"Tip: set ENFORCE_EXACT_OD=False to let me auto-detect (will use '{ycol}')."
-                )
-
-        if ycol is None:
-            raise ValueError(
-                "Could not determine OD column.\n"
-                f"Columns present: {list(df.columns)}\n"
-                "Try renaming your OD column to one of: "
-                f"{DATA_COL_GUESSES['od']}"
-            )
-
-        # --- Coerce OD to numeric and drop NaNs; align TS accordingly ---
-        od_series = self._smart_to_numeric(df[ycol])
-        keep_mask = od_series.notna()
-        if keep_mask.sum() == 0:
-            raise ValueError(
-                f"OD column '{ycol}' parsed to all NaN. "
-                "Likely due to unexpected formatting. "
-                "Try opening the file and saving as CSV, or send a sample of the OD cells."
-            )
-
-        # Optional: if all zeros, warn loudly (this is what led to the flat line)
-        if (od_series[keep_mask] == 0).all():
-            raise ValueError(
-                f"OD column '{ycol}' parsed but all values are 0. "
-                "This usually means decimal commas/units weren’t handled—"
-                "please verify a few raw cell values.")
-
-        self.od = od_series[keep_mask].tolist()
-        self.ts = df.loc[keep_mask, tcol].astype(str).tolist()
+        self.od = filtered_df_dict['NDC_System_OD_Value']['Tag_value'].tolist()
+        self.ts = filtered_df_dict['NDC_System_OD_Value']['t_stamp'].astype(str).tolist()
 
         try:
-            v = od_series[keep_mask]
-            App.status(f"Using time='{tcol}', OD='{ycol}' • rows={len(v)} "
+            v = self.od
+            App.status(f"Using time='{'t_stamp'}', OD='{'Tag_value'}' • rows={len(v)} "
                     f"• min={v.min():.6g}, max={v.max():.6g}, mean={v.mean():.6g}")
         except Exception:
             pass
 
 
-        # timestamps (as strings for UI) for the same rows
-        self.ts = df.loc[keep_mask, tcol].astype(str).tolist()
-
-        # Parsed timestamps (for class index mapping); synthesize if mostly bad
-        try:
-            ts_dt = pd.to_datetime(df.loc[keep_mask, tcol], errors="coerce")
-        except Exception:
-            ts_dt = pd.Series([pd.NaT] * keep_mask.sum())
-
-        if ts_dt.isna().sum() > 0.9 * len(ts_dt):
-            base = pd.Timestamp.utcnow()
-            self.ts_dt = [base + pd.Timedelta(seconds=i) for i in range(len(self.od))]
-        else:
-            self.ts_dt = ts_dt.tolist()
 
         self.last_loaded_rows = len(self.od)
         self.path = path
 
         # Optional: let the status bar show what we picked
         try:
-            App.status(f"Using time='{tcol}', OD='{ycol}'. Rows kept: {self.last_loaded_rows}.")
+            App.status(f"Using time='{'t_stamp'}', OD='{'Tag_value'}'. Rows kept: {self.last_loaded_rows}.")
         except Exception:
             pass
 
@@ -1227,7 +1171,7 @@ class DataPage(BasePage):
         for i in range(12): controls.columnconfigure(i, weight=1)
         # DataPage.__init__ controls block
 
-        ttk.Button(controls, text="Load CSV/XLSX…",        command=self.load_csv         ).grid(row=0, column=0, sticky="w", padx=(0,8))
+        ttk.Button(controls, text="Load XLSX…",        command=self.load_csv         ).grid(row=0, column=0, sticky="w", padx=(0,8))
         
         ttk.Button(controls, text="Open in VS Code",       command=lambda: open_in_vscode(os.path.abspath("."))).grid(row=0, column=5, sticky="w", padx=(0,8))
         ttk.Button(controls, text="Load Secondary…", command=self.load_secondary).grid(row=0, column=8, sticky="w", padx=(0,8))
@@ -1243,11 +1187,8 @@ class DataPage(BasePage):
 
     def load_csv(self):
         path = filedialog.askopenfilename(
-            title="Select data file (CSV/XLSX/XLS)",
-            filetypes=[("Data files", "*.csv *.xlsx *.xls"),
-                       ("CSV files", "*.csv"),
-                       ("Excel files", "*.xlsx *.xls"),
-                       ("All files","*.*")]
+            title="Select XLSX file (",
+            filetypes=[("Excel files", "*.xlsx *.xls")]
         )
         if not path: return
         try:
@@ -1337,7 +1278,45 @@ class DataPage(BasePage):
         except Exception as e:
             messagebox.showerror("Load from Features failed", str(e)); App.status("Load from features failed")
 
+class ModelPage(BasePage):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.headline("Select a model and window size")
+        controls = ttk.Frame(self); controls.grid(row=1, column=0, sticky="ew", pady=(0,12))
+        self.models = {}
+        self.load_models()
 
+        self.cb = ttk.Combobox(controls, values=sorted(list(self.models.keys())), height=30, width=30)
+        self.cb.set("Pick a model")
+        self.cb.pack()
+        self.cb.bind('<<ComboboxSelected>>', self.on_model_select)
+
+    def on_model_select(self, event):
+        # print(self.cb.get())
+        DATA.model = self.models[self.cb.get()]
+
+    def load_models(self):
+        all_model_files = os.listdir("models")
+        for model_file in all_model_files:
+            model_path = os.path.join("models", model_file)
+            with open(model_path, 'rb') as f:
+                model = pickle.load(f)
+                name_parts = model_file.split("_")
+                match name_parts[1]:
+                    case 'logit':
+                        model_name = f"Logistic Regression (Window Size {name_parts[2][2:-4]})"
+                        self.models[model_name] = model
+                    case 'rf':
+                        model_name = f"Random Forest (Window Size {name_parts[2][2:-4]})"
+                        self.models[model_name] = model
+                    case 'svm':
+                        model_name = f"SVM (Window Size {name_parts[2][2:-4]})"
+                        self.models[model_name] = model
+                    case 'xgboost':
+                        model_name = f"XGBoost (Window Size {name_parts[2][2:-4]})"
+                        self.models[model_name] = model
+                    case _:
+                        self.models[model_file] = model
 
 class LiveTimeSeries(ttk.Frame):
     """Matplotlib live plot with class shading via axvspan."""
@@ -1755,6 +1734,7 @@ class App(tk.Tk):
 
         self.pages = {
             "Data": DataPage(self.container),
+            "Model": ModelPage(self.container),
             "Results": ResultsPage(self.container),
             "History": HistoryPage(self.container),
             "Analysis": AnalysisPage(self.container),
@@ -1792,7 +1772,7 @@ class App(tk.Tk):
         bar = ttk.Frame(parent, style="Sidebar.TFrame", padding=12)
         ttk.Label(bar, text="Wavy Detection", foreground="white", background="#111827",
                   font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0,16))
-        for name, accel in [("Data","Ctrl+1"),("Results","Ctrl+2"),("History","Ctrl+3"),("Analysis","Ctrl+4")]:
+        for name, accel in [("Data","Ctrl+1"),("Model","Ctrl+2"),("Results","Ctrl+3"),("History","Ctrl+4"),("Analysis","Ctrl+5")]:
             ttk.Button(bar, text=f"{name}    ({accel})", style="Sidebar.TButton",
                        command=lambda n=name: self.show(n)).pack(fill="x", pady=6)
         ttk.Label(bar, text="", background="#111827").pack(expand=True, fill="both")
