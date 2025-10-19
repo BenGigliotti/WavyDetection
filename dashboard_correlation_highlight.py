@@ -15,6 +15,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 import pickle
+from PIL import Image, ImageTk
 
 APP_TITLE   = "Wavy Detection Prototype Dashboard"
 APP_VERSION = "v0.4 (history+needle+class overlays)"
@@ -165,6 +166,7 @@ class DataStore:
         self.paired_df = None # pandas DataFrame with columns ["od","sec","t"]
 
         self.model = None
+        self.window_size = None
 
 
     def _read_any_table(self, path: str):
@@ -981,10 +983,16 @@ class TrendChart(ttk.Frame):
         # --- CLASS OVERLAYS (stipple ~= alpha) ---
         # --- CLASS OVERLAYS (shaded bands using stipple ~= alpha) ---
         if getattr(DATA, "classes", None):
+            # Store image references to prevent garbage collection
+            if not hasattr(self, '_overlay_images'):
+                self._overlay_images = []
+            self._overlay_images.clear()
+            
             y0 = pad + 1
             y1 = h - pad - 1
             n_total = len(DATA.od)
             offset = n_total - len(y)  # global index represented by local x==0
+            
             for seg in DATA.classes:
                 if seg["label"] not in VISIBLE_CLASSES:
                     continue
@@ -996,9 +1004,31 @@ class TrendChart(ttk.Frame):
                 i0 = max(0, min(i0, len(y) - 2))     # allow room for at least 1 sample
                 i1 = max(i0 + 1, min(i1, len(y) - 1))
 
-                x0 = X(i0); x1 = X(i1)
+                x0 = X(i0)
+                x1 = X(i1)
+                
+                # Get color and create semi-transparent overlay
                 color = CLASS_COLORS.get(seg["label"], "#BBBBBB")
-                self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, width=0, stipple="gray25")
+                rgb = self.canvas.winfo_rgb(color)
+                # winfo_rgb returns 16-bit values (0-65535), convert to 8-bit (0-255)
+                r = rgb[0] >> 8
+                g = rgb[1] >> 8
+                b = rgb[2] >> 8
+                alpha = 80  # transparency (0=transparent, 255=opaque)
+                
+                # Create RGBA image with proper dimensions
+                width = int(x1 - x0)
+                height = int(y1 - y0)
+                
+                if width > 0 and height > 0:
+                    image = Image.new('RGBA', (width, height), (r, g, b, alpha))
+                    photo = ImageTk.PhotoImage(image)
+                    self._overlay_images.append(photo)  # Keep reference!
+                    
+                    # Use x0, y0 with anchor='nw' to position at top-left
+                    self.canvas.create_image(x0, y0, image=photo, anchor='nw')
+                
+                # Draw label
                 self.canvas.create_text(x0+4, y0+10, text=seg["label"], anchor="w",
                                         fill="#333333", font=("Segoe UI", 8, "bold"))
 
@@ -1294,6 +1324,7 @@ class ModelPage(BasePage):
     def on_model_select(self, event):
         # print(self.cb.get())
         DATA.model = self.models[self.cb.get()]
+        DATA.window_size = int(self.cb.get().split('Window Size ')[1].rstrip(')'))
 
     def load_models(self):
         all_model_files = os.listdir("models")

@@ -108,7 +108,7 @@ def train_model_on_window_size(df_good, df_bad, window_size):
     models = {
         'logit': LogisticRegression(max_iter=1000, random_state=42),
         'rf': RandomForestClassifier(n_estimators=100, random_state=42),
-        'svm': SVC(kernel='rbf', random_state=42),
+        'svm': SVC(kernel='rbf', random_state=42, probability=True),
         'xgboost': xgb.XGBClassifier()
     }
     
