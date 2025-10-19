@@ -168,6 +168,8 @@ class DataStore:
         self.model = None
         self.window_size = None
 
+        self.available_sheets = []
+
 
     def _read_any_table(self, path: str, sheet = None):
         """Return a pandas DataFrame from CSV/XLS/XLSX (first sheet for Excel)."""
@@ -265,11 +267,17 @@ class DataStore:
         return filtered_dict
 
     def load_data(self, path: str):
-        """Load time-series data from CSV/XLSX with robust time/OD detection."""
         if not os.path.exists(path):
             raise FileNotFoundError(path)
         
         self.path = path
+
+        ext = os.path.splitext(path.lower())[1]
+        if ext in [".xlsx", ".xls"]:
+            excel_file = pd.ExcelFile(path)
+            self.available_sheets = excel_file.sheet_names
+        else:
+            self.available_sheets = []
 
         df_dict = self._read_any_table(path, "NDC_System_OD_Value")
         if df_dict is None or len(df_dict) == 0:
@@ -290,7 +298,6 @@ class DataStore:
         self.last_loaded_rows = len(self.od)
         self.path = path
 
-        # Optional: let the status bar show what we picked
         try:
             App.status(f"Using time='{'t_stamp'}', OD='{'Tag_value'}'. Rows kept: {self.last_loaded_rows}.")
         except Exception:
@@ -351,64 +358,53 @@ class DataStore:
         paired = paired.dropna().reset_index(drop=True)
         return paired[["t","od","sec"]]
     
-    def load_secondary(self, path: str):
-        """
-        Load a second series (e.g., ovality), align it by time to the current OD,
-        and keep a paired DataFrame for correlation.
-        """
-        if not os.path.exists(path):
-            raise FileNotFoundError(path)
-        if not self.od:
-            raise ValueError("Load the OD data first.")
-
-        ext = os.path.splitext(path.lower())[1]
-        df_sec = pd.read_excel(path, sheet_name=0) if ext in [".xlsx", ".xls"] else pd.read_csv(path)
+    def load_secondary_sheet(self, sheet_name: str):
+        if not self.path:
+            raise ValueError("Load the main data file first.")
+        if not os.path.exists(self.path):
+            raise FileNotFoundError(self.path)
+        
+        ext = os.path.splitext(self.path.lower())[1]
+        if ext not in [".xlsx", ".xls"]:
+            raise ValueError("Secondary sheet loading only works with Excel files.")
+        
+        df_dict = pd.read_excel(self.path, sheet_name=[sheet_name, 'YS_Pullout1_Act_Speed_fpm'])
+        
+        df_sec = df_dict[sheet_name]
         if df_sec is None or df_sec.empty:
-            raise ValueError("Secondary file is empty.")
+            raise ValueError(f"Sheet '{sheet_name}' is empty.")
+        
+        filtered_dict = self.filter_by_speed(df_dict)
+        df_sec_filtered = filtered_dict[sheet_name]
 
-        # pick columns
-        cols_s = list(df_sec.columns)
-        tcol_s = pick(cols_s, SECONDARY_COL_GUESSES["time"]) or cols_s[0]
-        ycol_s = pick(cols_s, SECONDARY_COL_GUESSES["val"])
-        if ycol_s is None:
-            # fallback: first numeric column that isn't time
-            for c in cols_s:
-                if c != tcol_s and pd.api.types.is_numeric_dtype(df_sec[c]):
-                    ycol_s = c; break
-        if ycol_s is None:
-            raise ValueError(f"Could not find secondary value column. Columns: {cols_s}")
+        cols_s = list(df_sec_filtered.columns)
+        tcol_s = pick(cols_s, SECONDARY_COL_GUESSES["time"]) or "t_stamp"
+        ycol_s = pick(cols_s, SECONDARY_COL_GUESSES["val"]) or "Tag_value"
+        
+        if tcol_s not in cols_s:
+            raise ValueError(f"Could not find time column in sheet '{sheet_name}'. Columns: {cols_s}")
+        if ycol_s not in cols_s:
+            raise ValueError(f"Could not find value column in sheet '{sheet_name}'. Columns: {cols_s}")
 
-        # We need the original DF used to make OD. Re-read it to get chosen columns.
-        extm = os.path.splitext(self.path.lower())[1]
-        df_main = pd.read_excel(self.path, sheet_name=0) if extm in [".xlsx",".xls"] else pd.read_csv(self.path)
-        cols_m = list(df_main.columns)
-        tcol_m = pick(cols_m, DATA_COL_GUESSES["time"]) or cols_m[0]
+        df_dict_od = pd.read_excel(self.path, sheet_name=['NDC_System_OD_Value', 'YS_Pullout1_Act_Speed_fpm'])
+        filtered_dict_od = self.filter_by_speed(df_dict_od)
+        df_main_filtered = filtered_dict_od['NDC_System_OD_Value']
+        
+        tcol_m = "t_stamp"
+        ycol_m = "Tag_value"
 
-        # Which OD column did we actually use?
-        od_candidates = [globals().get("EXACT_OD_COLUMN", None)] + DATA_COL_GUESSES["od"]
-        od_candidates = [c for c in od_candidates if c]  # drop None
-        ycol_m = None
-        for c in od_candidates:
-            if c in df_main.columns:
-                ycol_m = c; break
-        if ycol_m is None:
-            # fall back to first numeric non-time
-            for c in cols_m:
-                if c != tcol_m and pd.api.types.is_numeric_dtype(df_main[c]):
-                    ycol_m = c; break
-
-        # get aligned pairs
-        paired = self._align_series(df_main, tcol_m, ycol_m, df_sec, tcol_s, ycol_s)
+        paired = self._align_series(df_main_filtered, tcol_m, ycol_m, 
+                                    df_sec_filtered, tcol_s, ycol_s)
         if paired.empty:
-            raise ValueError("No overlapping timestamps between OD and the secondary file.")
+            raise ValueError(f"No overlapping timestamps between OD and '{sheet_name}' after speed filtering.")
 
         self.paired_df = paired
-        self.sec_path = path
-        self.sec_name = os.path.basename(path)
+        self.sec_path = self.path
+        self.sec_name = sheet_name
         self.sec_ts_dt = paired["t"].tolist()
         self.sec_vals = paired["sec"].tolist()
 
-        App.status(f"Secondary loaded & aligned: {self.sec_name} • paired rows={len(self.paired_df)}")
+        App.status(f"Secondary loaded & aligned: {sheet_name} • paired rows={len(self.paired_df)} (speed filtered)")
 
     def corr_stats(self, max_lag_samples: int = 300):
         """
@@ -1186,11 +1182,16 @@ class DataPage(BasePage):
         for i in range(12): controls.columnconfigure(i, weight=1)
         # DataPage.__init__ controls block
 
-        ttk.Button(controls, text="Load XLSX…",        command=self.load_xlsx         ).grid(row=0, column=0, sticky="w", padx=(0,8))
+        ttk.Button(controls, text="Load XLSX…", command=self.load_xlsx).grid(row=0, column=0, sticky="w", padx=(0,8))
+        ttk.Button(controls, text="Open in VS Code", command=lambda: open_in_vscode(os.path.abspath("."))).grid(row=0, column=5, sticky="w", padx=(0,8))
         
-        ttk.Button(controls, text="Open in VS Code",       command=lambda: open_in_vscode(os.path.abspath("."))).grid(row=0, column=5, sticky="w", padx=(0,8))
-        ttk.Button(controls, text="Load Secondary…", command=self.load_secondary).grid(row=0, column=8, sticky="w", padx=(0,8))
-        ttk.Button(controls, text="OD ↔ Secondary Correlation", command=self.show_corr).grid(row=0, column=9, sticky="w", padx=(0,8))
+        ttk.Label(controls, text="Compare to:").grid(row=0, column=8, sticky="w", padx=(0,4))
+        self.sheet_var = tk.StringVar(value="Select sheet...")
+        self.sheet_dropdown = ttk.Combobox(controls, textvariable=self.sheet_var, state="disabled", width=25)
+        self.sheet_dropdown.grid(row=0, column=9, sticky="w", padx=(0,8))
+        self.sheet_dropdown.bind('<<ComboboxSelected>>', self.on_sheet_select)
+        
+        ttk.Button(controls, text="Show Correlation", command=self.show_corr).grid(row=0, column=10, sticky="w", padx=(0,8))
 
 
         self.info = ttk.Label(self, text="No file loaded.", foreground="#6B7280")
@@ -1202,17 +1203,42 @@ class DataPage(BasePage):
 
     def load_xlsx(self):
         path = filedialog.askopenfilename(
-            title="Select XLSX file (",
+            title="Select XLSX file",
             filetypes=[("Excel files", "*.xlsx *.xls")]
         )
         if not path: return
         try:
             DATA.load_data(path)
             self.info.config(text=f"Loaded: {os.path.basename(path)}  •  rows={len(DATA.od)}")
+            
+            excluded = ['NDC_System_OD_Value', 'YS_Pullout1_Act_Speed_fpm']
+            available = [s for s in DATA.available_sheets if s not in excluded]
+            
+            if available:
+                self.sheet_dropdown['values'] = available
+                self.sheet_dropdown['state'] = 'readonly'
+                self.sheet_var.set("Select sheet...")
+            else:
+                self.sheet_dropdown['values'] = []
+                self.sheet_dropdown['state'] = 'disabled'
+                self.sheet_var.set("No other sheets")
+            
             App.status("Data loaded. History & gauge now using real data.")
         except Exception as e:
             messagebox.showerror("Load Data failed", str(e))
             App.status("Data load failed")
+
+    def on_sheet_select(self, event):
+        selected_sheet = self.sheet_var.get()
+        if selected_sheet and selected_sheet not in ["Select sheet...", "No other sheets"]:
+            try:
+                DATA.load_secondary_sheet(selected_sheet)
+                self.info.config(text=f"{self.info.cget('text')}  •  comparing to '{selected_sheet}' (paired={len(DATA.paired_df)})")
+                App.status(f"Secondary sheet loaded: {selected_sheet}")
+            except Exception as e:
+                messagebox.showerror("Load Secondary failed", str(e))
+                App.status("Load secondary failed")
+                self.sheet_var.set("Select sheet...")
 
     def load_classes(self):
         if not DATA.od:
@@ -1234,29 +1260,9 @@ class DataPage(BasePage):
             messagebox.showerror("Load Classes failed", str(e))
             App.status("Classes load failed")
 
-    def load_secondary(self):
-        if not DATA.od:
-            messagebox.showwarning("Load OD first", "Please load the OD CSV/XLSX first.")
-            return
-        path = filedialog.askopenfilename(
-            title="Select secondary file (CSV/XLSX/XLS)",
-            filetypes=[("Data files", "*.csv *.xlsx *.xls"),
-                       ("CSV files", "*.csv"),
-                       ("Excel files", "*.xlsx *.xls"),
-                       ("All files","*.*")]
-        )
-        if not path: return
-        try:
-            DATA.load_secondary(path)
-            self.info.config(text=f"{self.info.cget('text')}  •  secondary='{os.path.basename(path)}' (paired={len(DATA.paired_df)})")
-            App.status("Secondary series loaded and aligned.")
-        except Exception as e:
-            messagebox.showerror("Load Secondary failed", str(e))
-            App.status("Load secondary failed")
-
     def show_corr(self):
         if DATA.paired_df is None or DATA.paired_df.empty:
-            messagebox.showinfo("Correlation", "Load a secondary file first (and ensure it aligned).")
+            messagebox.showinfo("Correlation", "Select a secondary sheet first from the dropdown.")
             return
         CorrelationWindow(self)
 
