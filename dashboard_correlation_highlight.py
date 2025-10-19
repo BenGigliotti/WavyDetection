@@ -503,20 +503,9 @@ class DataStore:
         return self.ts_dt[-1]
 
     def current_class(self):
-        """
-        Return (label, risk_float) for the current timestamp, if it falls
-        inside a loaded class segment; else (None, None).
-        """
-        if not self.classes or not self.ts_dt:
+        if not self.classes:
             return None, None
-        t = self.ts_dt[-1]
-        # Fast path using precomputed i0..i1 spans
-        i_last = len(self.od) - 1
-        for seg in reversed(self.classes):
-            if seg["i0"] <= i_last < seg["i1"]:
-                lbl = seg["label"]
-                return lbl, self.CLASS_TO_RISK.get(lbl, 0.5)
-        return None, None
+        return self.classes[-1]["label"], self.classes[-1]["risk"]
 
     def load_classes_from_features(self, path: str):
         if not os.path.exists(path):
@@ -1330,7 +1319,7 @@ class ModelPage(BasePage):
         right_frame = ttk.Frame(self)
         right_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
         
-        ttk.Label(right_frame, text="Average Prediction Confidence vs Window Size", 
+        ttk.Label(right_frame, text="Average likelihood of chatter being detected in entire dataset, by model", 
                  style="Subhead.TLabel").pack(anchor="w", pady=(0, 8))
         
         self.fig_conf = Figure(figsize=(8, 5), dpi=100)
@@ -1349,6 +1338,12 @@ class ModelPage(BasePage):
         DATA.window_size = int(self.cb.get().split('Window Size ')[1].rstrip(')'))
         if DATA.od:
             DATA.auto_classify(DATA.window_size)
+            app_instance = self.winfo_toplevel()
+            if hasattr(app_instance, 'pages') and 'Results' in app_instance.pages:
+                results_page = app_instance.pages['Results']
+                results_page._tick()
+            
+            App.status(f"Model changed and classifications updated")
 
     def update_confidence_plot(self):
         if not DATA.od or len(DATA.od) < 100:
@@ -1420,8 +1415,8 @@ class ModelPage(BasePage):
                             label=model_type, color=color)
         
         self.ax_conf.set_xlabel('Window Size (samples)', fontsize=11)
-        self.ax_conf.set_ylabel('Average Chatter Confidence (%)', fontsize=11)
-        self.ax_conf.set_title('Model Prediction Confidence vs Window Size', 
+        self.ax_conf.set_ylabel('Average Chatter Likelihood (%)', fontsize=11)
+        self.ax_conf.set_title('Model Prediction Likelihood vs Window Size', 
                               fontsize=12, fontweight='bold')
         self.ax_conf.legend(loc='best', fontsize=9)
         self.ax_conf.grid(True, alpha=0.3)
@@ -1601,7 +1596,6 @@ class ResultsPage(BasePage):
 
         self.pred_label.config(text=f"Predicted class: {lbl}")
         self.pred_conf.config(text=f"Confidence: {risk*100:0.1f}%")
-    # (demo confusion/kpis stays the same)
 
 
         # If no class window overlaps the latest point, derive a risk from NG score.
@@ -1634,16 +1628,28 @@ class ResultsPage(BasePage):
 
 
     def _tick(self):
-        if DATA.od:
+        pct = 50
+        
+        if DATA.od and DATA.classes:
             lbl, class_risk = DATA.current_class()
             if class_risk is not None:
                 pct = class_risk * 100.0
                 self.pred_label.config(text=f"Predicted class: {lbl}")
                 self.pred_conf.config(text=f"Confidence: {pct:0.1f}%")
             else:
-                pct = DATA.ng_score(n=1024, spec_mm=10.0, spec_band=0.02)
-        else:
+                pct = 0
+                self.pred_label.config(text="Error")
+                self.pred_conf.config(text=f"Error")
+        elif DATA.od:
+            # data loaded but no model selected yet
             pct = 50 + 15 * math.sin(datetime.now().timestamp()/2.0)
+            self.pred_label.config(text="Predicted class: —")
+            self.pred_conf.config(text="Please select a model")
+        else:
+            # no data - demo mode
+            pct = 50 + 15 * math.sin(datetime.now().timestamp()/2.0)
+            self.pred_label.config(text="Predicted class: —")
+            self.pred_conf.config(text="Please import data and select a model")
 
         self.gauge.set_value(pct)
         self.after(1000, self._tick)
