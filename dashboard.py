@@ -18,7 +18,7 @@ import pickle
 from PIL import Image, ImageTk
 
 APP_TITLE   = "Wavy Detection Prototype Dashboard"
-APP_VERSION = "v0.4 (history+needle+class overlays)"
+APP_VERSION = "v0.5"
 
 # ---- Force the OD column by exact name ----
 EXACT_OD_COLUMN = "Tag_value"  # <- put your exact Excel header here
