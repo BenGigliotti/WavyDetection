@@ -169,11 +169,14 @@ class DataStore:
         self.window_size = None
 
 
-    def _read_any_table(self, path: str):
+    def _read_any_table(self, path: str, sheet = None):
         """Return a pandas DataFrame from CSV/XLS/XLSX (first sheet for Excel)."""
         ext = os.path.splitext(path.lower())[1]
         if ext in [".xlsx", ".xls"]:
-            return pd.read_excel(path, sheet_name=None, parse_dates=[0])
+            if sheet == None:
+                return pd.read_excel(path, sheet_name=None, parse_dates=[0])
+            else:
+                return pd.read_excel(path, sheet_name=[sheet, 'YS_Pullout1_Act_Speed_fpm'], parse_dates=[0])
         
     def _smart_to_numeric(self, series: pd.Series) -> pd.Series:
         """
@@ -268,7 +271,7 @@ class DataStore:
         
         self.path = path
 
-        df_dict = self._read_any_table(path)
+        df_dict = self._read_any_table(path, "NDC_System_OD_Value")
         if df_dict is None or len(df_dict) == 0:
             raise ValueError("Empty file.")
         
@@ -284,8 +287,6 @@ class DataStore:
         except Exception:
             pass
 
-
-
         self.last_loaded_rows = len(self.od)
         self.path = path
 
@@ -295,7 +296,8 @@ class DataStore:
         except Exception:
             pass
 
-        self.auto_classify(fs=1.0, win_sec=60, step_sec=30)
+        if self.model is not None:
+            self.auto_classify(window_size=self.window_size)
 
             # Map labels -> an NG risk in [0..1] (tune if you like)
     CLASS_TO_RISK = {
@@ -601,99 +603,82 @@ class DataStore:
         self.classes = spans
         App.status(f"Classes from features loaded: {len(self.classes)} spans.")
 
-    def auto_classify(self, fs=1.0, win_sec=60, step_sec=30):
-        """
-        Heuristic 5-class segmentation from the loaded OD signal.
-        Fills self.classes with spans having labels in:
-        STEADY, MILD_WAVE, STRONG_WAVE, DRIFT, BURSTY_NOISY
-        """
-        if not self.od:
-            self.classes = []
+    def extract_features(self, window_data):
+        mean_val = np.mean(window_data)
+        std_val = np.std(window_data)
+        # div by zero
+        if mean_val == 0:
+            mean_val = 1e-10
+        
+        # features are normalized to the mean here to take into account spans of multiple different tubing target sizes
+        features = {
+            'coef_variation': std_val / mean_val,  # coefficient of variation ak relative std
+            'relative_range': np.ptp(window_data) / mean_val,  # range relative to mean
+            'normalized_variance': np.var(window_data) / (mean_val ** 2),
+            'peak_to_peak_ratio': np.ptp(window_data) / np.abs(mean_val),
+            'relative_max_deviation': (np.max(window_data) - mean_val) / mean_val,
+            'relative_min_deviation': (mean_val - np.min(window_data)) / mean_val,
+            # differences between consecutive points, indicates smoothness
+            'mean_abs_diff': np.mean(np.abs(np.diff(window_data))) / mean_val,
+            'max_abs_diff': np.max(np.abs(np.diff(window_data))) / mean_val,
+        }
+        
+        return features
+    
+    def get_label_from_risk_prob(self, risk):
+        if   risk < 0.25: return "STEADY"
+        elif risk < 0.45: return "MILD_WAVE"
+        elif risk < 0.65: return "DRIFT"
+        elif risk < 0.80: return "BURSTY_NOISY"
+        else:             return "STRONG_WAVE"
+
+    def auto_classify(self, window_size=60):
+        if self.model is None:
+            App.status("No model selected. Please select a model first.")
             return
+        
+        # Clear existing classes
+        self.classes = []
+        
+        num_windows = len(self.od) // window_size
 
-        x = np.asarray(self.od, dtype=float)
-        n = len(x)
+        # Collect all features first
+        features_list = []
+        window_metadata = []  # Store start/end indices for each window
+        
+        for i in range(num_windows):
+            start_idx = i * window_size
+            end_idx = start_idx + window_size
+            window = self.od[start_idx:end_idx]
+            
+            # Extract features as a dictionary
+            features_dict = self.extract_features(window)
+            features_list.append(features_dict)
+            window_metadata.append((start_idx, end_idx))
+        
+        # Convert to DataFrame (same as training)
+        X = pd.DataFrame(features_list)
+        
+        # Scale all features at once (same as training)
+        # scaler = StandardScaler()
+        # X_scaled = scaler.fit_transform(X)
+        
+        # Predict for all windows
+        probas = self.model.predict_proba(X)
+        
+        # Create class segments
+        for i, (start_idx, end_idx) in enumerate(window_metadata):
+            chatter_confidence = probas[i][1]  # Probability of class 1 (chatter/bad)
+            
+            self.classes.append({
+                "start": self.ts[start_idx],
+                "end": self.ts[end_idx],
+                "label": self.get_label_from_risk_prob(chatter_confidence),
+                "i0": start_idx,
+                "i1": end_idx,
+                "risk": chatter_confidence
+            })
 
-        # --- smooth baseline (robust moving average) ---
-        win = max(8, int(win_sec * fs))
-        step = max(1, int(step_sec * fs))
-        if win >= n:
-            win = max(8, n // 10)
-        baseline = pd.Series(x).rolling(win, min_periods=max(3, win//5)).mean().to_numpy()
-        baseline = np.nan_to_num(baseline, nan=np.nanmedian(x))
-        resid = x - baseline
-
-        # precompute window indices
-        starts = list(range(0, n - win + 1, step))
-        if not starts:
-            starts = [0]
-        stops = [min(s + win, n) for s in starts]
-
-        # features per window
-        feats = []
-        for s, e in zip(starts, stops):
-            y = x[s:e]
-            r = resid[s:e]
-
-            # slope on raw (trend)
-            k = len(y)
-            sx = k*(k-1)/2.0
-            sxx = k*(k-1)*(2*k-1)/6.0
-            sy = float(np.sum(y))
-            sxy = float(np.sum(np.arange(k)*y))
-            denom = k*sxx - sx*sx
-            slope = 0.0 if abs(denom) < 1e-12 else (k*sxy - sx*sy)/denom
-
-            r_ptp = float(np.max(r) - np.min(r))
-            r_mad = float(np.mean(np.abs(r - np.median(r))))
-            r_std = float(np.std(r))
-            # high-freq “noisiness” proxy
-            diff_std = float(np.std(np.diff(y))) if k > 2 else 0.0
-
-            feats.append((s, e, slope, r_ptp, r_mad, r_std, diff_std))
-
-        # robust thresholds from medians
-        abs_slopes = np.array([abs(f[2]) for f in feats])
-        r_ptps    = np.array([f[3] for f in feats])
-        r_mads    = np.array([f[4] for f in feats])
-        r_stds    = np.array([f[5] for f in feats])
-        dstds     = np.array([f[6] for f in feats])
-
-        eps = 1e-12
-        slope_thr = np.median(abs_slopes) + 3.0*np.median(np.abs(abs_slopes - np.median(abs_slopes)))
-        noise_thr = np.median(r_stds) + 2.5*np.median(np.abs(r_stds - np.median(r_stds)))
-        # wave thresholds based on residual amplitude
-        mild_thr   = np.median(r_ptps) + 1.5*np.median(np.abs(r_ptps - np.median(r_ptps)))
-        strong_thr = np.median(r_ptps) + 3.0*np.median(np.abs(r_ptps - np.median(r_ptps)))
-
-        spans = []
-        for (s, e, slope, r_ptp, r_mad, r_std, diff_std) in feats:
-            # decision order matters
-            if abs(slope) > max(slope_thr, 1e-9) and r_ptp < strong_thr:
-                lbl = "DRIFT"
-            elif r_std > noise_thr and r_ptp < strong_thr:
-                lbl = "BURSTY_NOISY"
-            elif r_ptp >= strong_thr:
-                lbl = "STRONG_WAVE"
-            elif r_ptp >= mild_thr:
-                lbl = "MILD_WAVE"
-            else:
-                lbl = "STEADY"
-
-            spans.append({"i0": int(s), "i1": int(e), "label": lbl,
-                          "start": self.ts_dt[s] if self.ts_dt else pd.NaT,
-                          "end":   self.ts_dt[e-1] if self.ts_dt else pd.NaT})
-
-        # Merge adjacent windows with the same label to make cleaner bands
-        merged = []
-        for seg in spans:
-            if not merged or seg["label"] != merged[-1]["label"] or seg["i0"] > merged[-1]["i1"]:
-                merged.append(seg)
-            else:
-                merged[-1]["i1"] = seg["i1"]
-                merged[-1]["end"] = seg["end"]
-
-        self.classes = merged
         App.status(f"Auto-classes computed: {len(self.classes)} span(s).")
 
 
@@ -1201,7 +1186,7 @@ class DataPage(BasePage):
         for i in range(12): controls.columnconfigure(i, weight=1)
         # DataPage.__init__ controls block
 
-        ttk.Button(controls, text="Load XLSX…",        command=self.load_csv         ).grid(row=0, column=0, sticky="w", padx=(0,8))
+        ttk.Button(controls, text="Load XLSX…",        command=self.load_xlsx         ).grid(row=0, column=0, sticky="w", padx=(0,8))
         
         ttk.Button(controls, text="Open in VS Code",       command=lambda: open_in_vscode(os.path.abspath("."))).grid(row=0, column=5, sticky="w", padx=(0,8))
         ttk.Button(controls, text="Load Secondary…", command=self.load_secondary).grid(row=0, column=8, sticky="w", padx=(0,8))
@@ -1215,7 +1200,7 @@ class DataPage(BasePage):
         self.columnconfigure(0, weight=1); self.rowconfigure(3, weight=1)
         self.placeholder(table_area, "Recent files & preview table will appear here.")
 
-    def load_csv(self):
+    def load_xlsx(self):
         path = filedialog.askopenfilename(
             title="Select XLSX file (",
             filetypes=[("Excel files", "*.xlsx *.xls")]
@@ -1325,6 +1310,9 @@ class ModelPage(BasePage):
         # print(self.cb.get())
         DATA.model = self.models[self.cb.get()]
         DATA.window_size = int(self.cb.get().split('Window Size ')[1].rstrip(')'))
+        if DATA.od:
+            DATA.auto_classify(DATA.window_size)
+
 
     def load_models(self):
         all_model_files = os.listdir("models")

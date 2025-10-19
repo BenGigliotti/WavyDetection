@@ -6,6 +6,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
+from sklearn.utils import class_weight
 import xgboost as xgb
 import warnings
 warnings.filterwarnings('ignore')
@@ -104,19 +105,27 @@ def train_model_on_window_size(df_good, df_bad, window_size):
     all_labels = good_labels + bad_labels
     X = pd.DataFrame(all_features)
     y = np.array(all_labels)
+
+    classes_weights = class_weight.compute_sample_weight(
+        class_weight='balanced',
+        y=y
+    )
     
     models = {
-        'logit': LogisticRegression(max_iter=1000, random_state=42),
-        'rf': RandomForestClassifier(n_estimators=100, random_state=42),
-        'svm': SVC(kernel='rbf', random_state=42, probability=True),
+        'logit': LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced'),
+        'rf': RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced'),
+        'svm': SVC(kernel='rbf', random_state=42, probability=True, class_weight='balanced'),
         'xgboost': xgb.XGBClassifier()
     }
     
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    # scaler = StandardScaler()
+    # X_scaled = scaler.fit_transform(X)
     models_out = {}
     for model_name, model in models.items():
-        model.fit(X_scaled, y)
+        if model_name == 'xgboost':
+            model.fit(X, y, sample_weight=classes_weights)
+        else:
+            model.fit(X, y)
         models_out[model_name] = model
     
     return models_out
