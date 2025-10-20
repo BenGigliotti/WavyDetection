@@ -1178,7 +1178,7 @@ class ModelPage(BasePage):
         right_frame = ttk.Frame(self)
         right_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
         
-        ttk.Label(right_frame, text="Average likelihood of chatter being detected in entire dataset (all windows), by each model over different window sizes\nHigher likelihood = chatter likely present | Lower likelihood = chatter unlikely | Middle likelihood = unsure prediction", 
+        ttk.Label(right_frame, text="Average likelihood of chatter being detected in entire dataset (all windows)\n         by each model over different window sizes\nHigher likelihood = chatter likely present\nLower likelihood = chatter unlikely\nMiddle likelihood near decision boundary = unsure prediction", 
                  style="Subhead.TLabel").pack(anchor="w", pady=(0, 8))
         
         self.fig_conf = Figure(figsize=(8, 5), dpi=100)
