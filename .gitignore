@@ -1,3 +1,5 @@
 *.pkl
 .DS_Store
 *.xlsx
+venv/
+.venv/
