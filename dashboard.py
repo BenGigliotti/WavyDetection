@@ -1378,7 +1378,7 @@ class LiveTimeSeries(ttk.Frame):
 
 
         self.ax.set_title("OD vs Samples — live")
-        self.ax.set_xlabel("sample index"); self.ax.set_ylabel("OD (mm)")
+        self.ax.set_xlabel("sample index"); self.ax.set_ylabel("OD (inches)")
         self.ax.legend(loc="upper left", fontsize=8)
         self.fig.tight_layout()
         self.canvas.draw()
@@ -1479,8 +1479,8 @@ class HistoryPage(BasePage):
         slope = DATA.trend_slope(1024)
         p2p   = DATA.volatility_p2p(1024)
         score = DATA.ng_score(1024, spec_mm=10.0, spec_band=0.02)
-        self.l_slope.config(text=f"Slope: {slope:0.6f} mm/sample")
-        self.l_p2p.config(text=f"Peak-to-peak: {p2p:0.4f} mm")
+        self.l_slope.config(text=f"Slope: {slope:0.6f} in/sample")
+        self.l_p2p.config(text=f"Peak-to-peak: {p2p:0.4f} in")
         self.l_score.config(text=f"Risk score: {score:0.1f}/100")
         self.chart.redraw()
         self.after(1000, self._tick)
