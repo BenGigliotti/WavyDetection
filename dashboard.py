@@ -3,9 +3,9 @@
 # Built only with Python stdlib + numpy/pandas/matplotlib/sklearn.
 # Integrated waviness class overlays (from Streamlit app) for History & Results pages.
 
-import os, csv, math, random, subprocess
+import os, math
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, OptionMenu
+from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 import numpy as np, pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -1305,7 +1305,7 @@ class ModelPage(BasePage):
         right_frame = ttk.Frame(self)
         right_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
         
-        ttk.Label(right_frame, text="Average likelihood of chatter being detected in entire dataset (all windows), by model\nHigher likelihood = chatter likely present | Lower likelihood = chatter not present | Middle likelihood = unsure prediction", 
+        ttk.Label(right_frame, text="Average likelihood of chatter being detected in entire dataset (all windows), by each model over different window sizes\nHigher likelihood = chatter likely present | Lower likelihood = chatter unlikely | Middle likelihood = unsure prediction", 
                  style="Subhead.TLabel").pack(anchor="w", pady=(0, 8))
         
         self.fig_conf = Figure(figsize=(8, 5), dpi=100)
@@ -1799,7 +1799,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1280x800"); self.minsize(1120, 720)
+        self.geometry("1400x850"); self.minsize(1120, 720)
 
         self._init_style(); self._init_menu()
 
