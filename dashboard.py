@@ -122,19 +122,6 @@ def normalize_label(s) -> str:
 VISIBLE_CLASSES = set(CLASS_COLORS.keys())
 
 # ========================= Utilities =========================
-def open_in_vscode(path="."):
-    try:
-        subprocess.Popen(["code", path]); return
-    except Exception:
-        pass
-    for c in [
-        r"C:\Users\%USERNAME%\AppData\Local\Programs\Microsoft VS Code\Code.exe",
-        r"C:\Program Files\Microsoft VS Code\Code.exe",
-        r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
-    ]:
-        exe = os.path.expandvars(c)
-        if os.path.exists(exe):
-            subprocess.Popen([exe, path]); return
 
 def pick(colnames, candidates):
     low = [c.lower() for c in colnames]
@@ -1172,7 +1159,6 @@ class DataPage(BasePage):
         # DataPage.__init__ controls block
 
         ttk.Button(controls, text="Load XLSX…", command=self.load_xlsx).grid(row=0, column=0, sticky="w", padx=(0,8))
-        ttk.Button(controls, text="Open in VS Code", command=lambda: open_in_vscode(os.path.abspath("."))).grid(row=0, column=5, sticky="w", padx=(0,8))
         
         ttk.Label(controls, text="Compare to:").grid(row=0, column=8, sticky="w", padx=(0,4))
         self.sheet_var = tk.StringVar(value="Select sheet...")
@@ -1314,12 +1300,12 @@ class ModelPage(BasePage):
         self.cb.pack(pady=(0, 16))
         self.cb.bind('<<ComboboxSelected>>', self.on_model_select)
         
-        ttk.Button(left_frame, text="Update Confidence Plot", command=self.update_confidence_plot).pack(pady=(8, 0))
+        ttk.Button(left_frame, text="Update Likelihood Plot", command=self.update_confidence_plot).pack(pady=(8, 0))
         
         right_frame = ttk.Frame(self)
         right_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
         
-        ttk.Label(right_frame, text="Average likelihood of chatter being detected in entire dataset, by model", 
+        ttk.Label(right_frame, text="Average likelihood of chatter being detected in entire dataset (all windows), by model\nHigher likelihood = chatter likely present | Lower likelihood = chatter not present | Middle likelihood = unsure prediction", 
                  style="Subhead.TLabel").pack(anchor="w", pady=(0, 8))
         
         self.fig_conf = Figure(figsize=(8, 5), dpi=100)
@@ -1327,7 +1313,7 @@ class ModelPage(BasePage):
         self.canvas_conf = FigureCanvasTkAgg(self.fig_conf, master=right_frame)
         self.canvas_conf.get_tk_widget().pack(fill="both", expand=True)
         
-        self.ax_conf.text(0.5, 0.5, "Load data and click 'Update Confidence Plot'\nto see model predictions", 
+        self.ax_conf.text(0.5, 0.5, "Load data and click 'Update Likelihood Plot'\nto see model predictions", 
                          ha="center", va="center", fontsize=12)
         self.ax_conf.axis("off")
         self.fig_conf.tight_layout()
@@ -1415,8 +1401,8 @@ class ModelPage(BasePage):
                             label=model_type, color=color)
         
         self.ax_conf.set_xlabel('Window Size (samples)', fontsize=11)
-        self.ax_conf.set_ylabel('Average Chatter Likelihood (%)', fontsize=11)
-        self.ax_conf.set_title('Model Prediction Likelihood vs Window Size', 
+        self.ax_conf.set_ylabel('Chatter Likelihood (%)', fontsize=11)
+        self.ax_conf.set_title('Average Chatter Likelihood vs Window Size', 
                               fontsize=12, fontweight='bold')
         self.ax_conf.legend(loc='best', fontsize=9)
         self.ax_conf.grid(True, alpha=0.3)
@@ -1459,7 +1445,7 @@ class ModelPage(BasePage):
 
     def reset_confidence_plot(self):
         self.ax_conf.clear()
-        self.ax_conf.text(0.5, 0.5, "Load data and click 'Update Confidence Plot'\nto see model predictions", 
+        self.ax_conf.text(0.5, 0.5, "Load data and click 'Update Likelihood Plot'\nto see model predictions", 
                          ha="center", va="center", fontsize=12, color='#6B7280')
         self.ax_conf.axis("off")
         self.fig_conf.tight_layout()
@@ -1530,12 +1516,11 @@ class LiveTimeSeries(ttk.Frame):
 class ResultsPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
-        self.headline("Results (Blueprint)")
+        self.headline("Results")
 
         tools = ttk.Frame(self); tools.grid(row=1, column=0, sticky="ew", pady=(0,12))
-        ttk.Button(tools, text="Predict Latest", command=self.predict_latest).grid(row=0, column=0, sticky="w", padx=(0,8))
-        ttk.Button(tools, text="Export Report", command=lambda: App.busy("Export report (todo)")).grid(row=0, column=1, sticky="w", padx=(0,8))
-        ttk.Button(tools, text="Open in VS Code", command=lambda: open_in_vscode(os.path.abspath("."))).grid(row=0, column=2, sticky="w")
+        # ttk.Button(tools, text="Predict Latest", command=self.predict_latest).grid(row=0, column=0, sticky="w", padx=(0,8))
+        # ttk.Button(tools, text="Export Report", command=lambda: App.busy("Export report (todo)")).grid(row=0, column=1, sticky="w", padx=(0,8))
 
         grid = ttk.Frame(self); grid.grid(row=2, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1); self.rowconfigure(2, weight=1)
@@ -1553,78 +1538,12 @@ class ResultsPage(BasePage):
         ttk.Label(right_top, text="OK / NG Indicator", style="Subhead.TLabel").pack(anchor="w")
         self.gauge = Gauge(right_top, width=360, height=200); self.gauge.pack(fill="both", expand=True, pady=(6,0))
 
-        right_bot = ttk.Frame(grid); right_bot.grid(row=1, column=1, sticky="nsew", padx=(8,0))
-        ttk.Label(right_bot, text="Model Metrics", style="Subhead.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6))
-        right_bot.columnconfigure((0,1,2,3), weight=1); right_bot.rowconfigure(1, weight=1)
-
-        mat = ttk.Frame(right_bot, padding=6, relief="ridge"); mat.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=(0,6))
-        for i in range(3): mat.columnconfigure(i, weight=1)
-        for i in range(3): mat.rowconfigure(i, weight=1)
-        ttk.Label(mat, text="Predicted", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, columnspan=2)
-        ttk.Label(mat, text="Actual", font=("Segoe UI", 9, "bold")).grid(row=1, column=0, rowspan=2, sticky="s")
-        ttk.Label(mat, text="OK").grid(row=1, column=1);   ttk.Label(mat, text="NG").grid(row=1, column=2)
-        ttk.Label(mat, text="OK").grid(row=2, column=0, sticky="e")
-        self.cm_tn = ttk.Label(mat, text="—", style="KPI.TLabel"); self.cm_tn.grid(row=2, column=1)
-        self.cm_fp = ttk.Label(mat, text="—", style="KPI.TLabel"); self.cm_fp.grid(row=2, column=2)
-        ttk.Label(mat, text="NG").grid(row=3, column=0, sticky="e")
-        self.cm_fn = ttk.Label(mat, text="—", style="KPI.TLabel"); self.cm_fn.grid(row=3, column=1)
-        self.cm_tp = ttk.Label(mat, text="—", style="KPI.TLabel"); self.cm_tp.grid(row=3, column=2)
-
-        kpis = ttk.Frame(right_bot); kpis.grid(row=1, column=2, columnspan=2, sticky="nsew")
-        for i in range(2): kpis.columnconfigure(i, weight=1)
-        self.k_acc = ttk.Label(kpis, text="Accuracy: —", style="KPI.TLabel"); self.k_acc.grid(row=0, column=0, sticky="w", pady=(0,6))
-        self.k_prec= ttk.Label(kpis, text="Precision: —", style="KPI.TLabel"); self.k_prec.grid(row=1, column=0, sticky="w", pady=(0,6))
-        self.k_rec = ttk.Label(kpis, text="Recall: —",    style="KPI.TLabel"); self.k_rec.grid(row=0, column=1, sticky="w", pady=(0,6))
-        self.k_f1  = ttk.Label(kpis, text="F1 Score: —",  style="KPI.TLabel"); self.k_f1.grid(row=1, column=1, sticky="w", pady=(0,6))
-
         self.pred_label = ttk.Label(right_top, text="Predicted class: —", style="KPI.TLabel")
         self.pred_label.pack(anchor="w", pady=(6, 0))
         self.pred_conf  = ttk.Label(right_top, text="Confidence: —", style="KPI.TLabel")
         self.pred_conf.pack(anchor="w")
 
         self.after(1000, self._tick)
-
-    def predict_latest(self):
-        lbl, risk = DATA.current_class()
-        if lbl is None:
-            risk = DATA.ng_score(n=1024, spec_mm=10.0, spec_band=0.02) / 100.0
-            if   risk < 0.25: lbl = "STEADY"
-            elif risk < 0.45: lbl = "MILD_WAVE"
-            elif risk < 0.65: lbl = "DRIFT"
-            elif risk < 0.80: lbl = "BURSTY_NOISY"
-            else:             lbl = "STRONG_WAVE"
-
-        self.pred_label.config(text=f"Predicted class: {lbl}")
-        self.pred_conf.config(text=f"Confidence: {risk*100:0.1f}%")
-
-
-        # If no class window overlaps the latest point, derive a risk from NG score.
-        if lbl is None:
-            risk = DATA.ng_score(n=1024, spec_mm=10.0, spec_band=0.02) / 100.0
-            # map continuous risk to a label-ish category
-            if   risk < 0.25: lbl = "STEADY"
-            elif risk < 0.45: lbl = "MILD_WAVE"
-            elif risk < 0.65: lbl = "DRIFT"
-            elif risk < 0.80: lbl = "BURSTY_NOISY"
-            else:             lbl = "STRONG_WAVE"
-
-        # Show to the user
-        self.pred_label.config(text=f"Predicted class: {lbl}")
-        self.pred_conf.config(text=f"Confidence: {risk*100:0.1f}%")
-
-        # Demo confusion-block numbers (keep your existing block if you want)
-        tp = int(100 * risk * 0.6); tn = int(100 * (1.0 - risk) * 0.6)
-        fp = int(100 * (1.0 - risk) * 0.4); fn = int(100 * risk * 0.4)
-        acc = (tp + tn) / max(1, (tp+tn+fp+fn))
-        prec = tp / max(1, (tp+fp)); rec = tp / max(1, (tp+fn))
-        f1 = 2*prec*rec / max(1e-9, (prec+rec))
-        self.cm_tp.config(text=str(tp)); self.cm_tn.config(text=str(tn))
-        self.cm_fp.config(text=str(fp)); self.cm_fn.config(text=str(fn))
-        self.k_acc.config(text=f"Accuracy: {acc*100:0.1f}%")
-        self.k_prec.config(text=f"Precision: {prec*100:0.1f}%")
-        self.k_rec.config(text=f"Recall: {rec*100:0.1f}%")
-        self.k_f1.config(text=f"F1 Score: {f1*100:0.1f}%")
-        App.status("Prediction updated from waviness class / risk.")
 
 
     def _tick(self):
@@ -1922,7 +1841,6 @@ class App(tk.Tk):
     def _init_menu(self):
         menubar = tk.Menu(self)
         filemenu = tk.Menu(menubar, tearoff=0)
-        filemenu.add_command(label="Open Project in VS Code", command=lambda: open_in_vscode(os.path.abspath(".")))
         filemenu.add_separator(); filemenu.add_command(label="Exit", command=self.destroy)
         menubar.add_cascade(label="File", menu=filemenu)
         self.config(menu=menubar)
