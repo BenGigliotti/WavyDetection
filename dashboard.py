@@ -253,7 +253,7 @@ class DataStore:
         
         return filtered_dict
 
-    def load_data(self, path: str):
+    def load_data(self, path: str, app=None):
         if not os.path.exists(path):
             raise FileNotFoundError(path)
         
@@ -274,6 +274,7 @@ class DataStore:
 
         self.od = filtered_df_dict['NDC_System_OD_Value']['Tag_value'].tolist()
         self.ts = filtered_df_dict['NDC_System_OD_Value']['t_stamp'].astype(str).tolist()
+        self.ts_dt = pd.to_datetime(filtered_df_dict['NDC_System_OD_Value']['t_stamp'], errors='coerce').tolist()
 
         try:
             v = self.od
@@ -290,8 +291,11 @@ class DataStore:
         except Exception:
             pass
 
-        if self.model is not None:
+        if self.model is not None and app is not None:
             self.auto_classify(window_size=self.window_size)
+            if hasattr(app, 'pages') and 'Analysis' in app.pages:
+                analysis_page = app.pages['Analysis']
+                analysis_page.update_confidence_timeline()
 
             # Map labels -> an NG risk in [0..1] (tune if you like)
     CLASS_TO_RISK = {
@@ -1002,138 +1006,6 @@ class TrendChart(ttk.Frame):
             self.canvas.create_text(legend_x+18, legend_y + idx*16, text=name, anchor="w",
                                     fill="#111827", font=("Segoe UI", 8))
 
-class FeatureEngine:
-    def __init__(self, od, window=30, fs=1.0):
-        self.od = np.asarray(od, dtype=float)
-        self.win = max(8, int(window * fs))
-        self.step = self.win // 2  # 50% overlap
-        self.fs = fs
-
-    def _windows(self):
-        x = self.od
-        for i in range(0, len(x)-self.win+1, self.step):
-            yield x[i:i+self.win]
-
-    def feature_table(self):
-        rows = []
-        for w in self._windows():
-            y = w
-            mean = float(np.mean(y))
-            std  = float(np.std(y))
-            p2p  = float(np.max(y) - np.min(y))
-            rel_range = p2p / max(1e-9, mean)
-            mad = float(rolling_mad(y))
-            rel_max = (np.max(y) - mean) / max(1e-9, mean)
-            rel_min = (mean - np.min(y)) / max(1e-9, mean)
-            coef_var = std / max(1e-9, mean)
-            norm_var = (std**2) / max(1e-9, mean**2)
-            ptp_ratio = p2p / max(1e-9, std)
-            rows.append({
-                "mean_abs_diff": mad,
-                "coef_variation": coef_var,
-                "relative_range": rel_range,
-                "normalized_variance": norm_var,
-                "peak_to_peak_ratio": ptp_ratio,
-                "relative_max_deviation": rel_max,
-                "relative_min_deviation": rel_min,
-                "max_abs_diff": p2p,
-            })
-        df = pd.DataFrame(rows).replace([np.inf, -np.inf], np.nan).dropna()
-        return df
-
-    def demo_labels(self, df):
-        thr = df["mean_abs_diff"].median() + df["mean_abs_diff"].std()
-        return (df["mean_abs_diff"] > thr).astype(int)
-
-    def kfold_curve(self, X, y, model, windows=[10,20,30,40,60,90,120]):
-        sizes, accs = [], []
-        for w in windows:
-            self.win = max(8, int(w * self.fs))
-            self.step = self.win // 2
-            df = self.feature_table()
-            if len(df) < 20: continue
-            Xw = df.values
-            yw = self.demo_labels(df) if y is None else y[:len(df)]
-            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-            scores = []
-            for tr, te in skf.split(Xw, yw):
-                Xtr, Xte = Xw[tr], Xw[te]
-                ytr = yw.iloc[tr] if isinstance(yw, pd.Series) else yw[tr]
-                yte = yw.iloc[te] if isinstance(yw, pd.Series) else yw[te]
-                scaler = StandardScaler()
-                Xtr = scaler.fit_transform(Xtr); Xte = scaler.transform(Xte)
-                model.fit(Xtr, ytr)
-                scores.append(model.score(Xte, yte))
-            sizes.append(w); accs.append(np.mean(scores))
-        return np.array(sizes), np.array(accs)
-
-    def fig_sixpack(self):
-        df = self.feature_table()
-        if df.empty:
-            fig = Figure(figsize=(12,6), dpi=100)
-            ax = fig.add_subplot(111)
-            ax.text(0.5,0.5,"Not enough data for analysis.\nLoad a longer CSV.", ha="center", va="center")
-            ax.axis("off")
-            return fig
-
-        y = self.demo_labels(df)
-        fig = Figure(figsize=(12,6), dpi=100)
-        gs = fig.add_gridspec(2,3, wspace=0.35, hspace=0.35)
-
-        clf = RandomForestClassifier(n_estimators=200, random_state=42)
-        sizes, acc_rf = self.kfold_curve(df.values, y, clf)
-        ax1 = fig.add_subplot(gs[0,0])
-        for mult, lab in [(0.98,"Logistic Regression (demo)"), (1.00,"Random Forest"), (0.995,"SVM (demo)")]:
-            ax1.plot(sizes, np.minimum(1.0, acc_rf*mult), marker="o", label=lab)
-        ax1.set_title("Average model accuracy vs. Window size\n5-split K-Folds")
-        ax1.set_xlabel("Window size (sec)"); ax1.set_ylabel("Average accuracy"); ax1.legend()
-
-        scaler = StandardScaler().fit(df.values)
-        Xs = scaler.transform(df.values)
-        clf.fit(Xs, y)
-        importances = clf.feature_importances_
-        order = np.argsort(importances)
-        ax2 = fig.add_subplot(gs[0,1])
-        ax2.barh(np.array(df.columns)[order], importances[order])
-        ax2.set_title("Random Forest feature importance\nWindow size: ~30 sec")
-        ax2.set_xlabel("Feature weight")
-
-        ax3 = fig.add_subplot(gs[0,2])
-        ax3.hist(df.loc[y==0,"mean_abs_diff"], bins=40, alpha=0.6, label="Good")
-        ax3.hist(df.loc[y==1,"mean_abs_diff"], bins=40, alpha=0.6, label="Rejected, chatter")
-        ax3.set_title("Mean Absolute Difference (smoothness indicator)\nWindow size: ~30 sec")
-        ax3.set_xlabel("Mean Absolute Difference"); ax3.set_ylabel("Density"); ax3.legend()
-
-        pca = PCA(n_components=2, random_state=42)
-        Xp = pca.fit_transform(Xs)
-        ax4 = fig.add_subplot(gs[1,0])
-        ax4.scatter(Xp[y==0,0], Xp[y==0,1], s=8, alpha=0.5, label="Good")
-        ax4.scatter(Xp[y==1,0], Xp[y==1,1], s=8, alpha=0.8, label="Bad (Chatter)", color="red")
-        ax4.set_title("Principal component analysis")
-        ax4.set_xlabel(f"PC1: {pca.explained_variance_ratio_[0]*100:0.1f}% variance")
-        ax4.set_ylabel(f"PC2: {pca.explained_variance_ratio_[1]*100:0.1f}% variance")
-        ax4.legend(loc="best")
-
-        ax5 = fig.add_subplot(gs[1,1])
-        comps = pca.components_
-        ax5.axvline(0,color="gray",linewidth=0.8); ax5.axhline(0,color="gray",linewidth=0.8)
-        for i, name in enumerate(df.columns):
-            ax5.arrow(0, 0, comps[0,i], comps[1,i], head_width=0.02, head_length=0.02, fc='k', ec='k', alpha=0.6)
-            ax5.text(comps[0,i]*1.08, comps[1,i]*1.08, name, fontsize=8,
-                     bbox=dict(boxstyle="round,pad=0.2", fc="#FFF9C4", ec="#999"))
-        ax5.set_xlim(-1,1); ax5.set_ylim(-1,1)
-        ax5.set_title("Feature weights on principal components")
-        ax5.set_xlabel("PC1 weights"); ax5.set_ylabel("PC2 weights")
-
-        ax6 = fig.add_subplot(gs[1,2])
-        corr = df.corr().values
-        im = ax6.imshow(corr, vmin=-1, vmax=1, cmap="coolwarm")
-        ax6.set_xticks(range(len(df.columns))); ax6.set_xticklabels(df.columns, rotation=60, ha="right", fontsize=8)
-        ax6.set_yticks(range(len(df.columns))); ax6.set_yticklabels(df.columns, fontsize=8)
-        ax6.set_title("Feature Correlation Matrix")
-        fig.colorbar(im, ax=ax6, fraction=0.046, pad=0.04).set_label("Correlation")
-        return fig
-
 # ========================= Pages =========================
 class BasePage(ttk.Frame):
     def __init__(self, parent, *args, **kwargs):
@@ -1183,7 +1055,8 @@ class DataPage(BasePage):
         )
         if not path: return
         try:
-            DATA.load_data(path)
+            app_instance = self.winfo_toplevel()
+            DATA.load_data(path, app=app_instance)
             self.info.config(text=f"Loaded: {os.path.basename(path)}  •  rows={len(DATA.od)}")
             
             excluded = ['NDC_System_OD_Value', 'YS_Pullout1_Act_Speed_fpm']
@@ -1325,9 +1198,12 @@ class ModelPage(BasePage):
         if DATA.od:
             DATA.auto_classify(DATA.window_size)
             app_instance = self.winfo_toplevel()
-            if hasattr(app_instance, 'pages') and 'Results' in app_instance.pages:
-                results_page = app_instance.pages['Results']
-                results_page._tick()
+            # if hasattr(app_instance, 'pages') and 'Results' in app_instance.pages:
+            #     results_page = app_instance.pages['Results']
+            #     results_page._tick()
+            if hasattr(app_instance, 'pages') and 'Analysis' in app_instance.pages:
+                analysis_page = app_instance.pages['Analysis']
+                analysis_page.update_confidence_timeline()
             
             App.status(f"Model changed and classifications updated")
 
@@ -1615,31 +1491,129 @@ class AnalysisPage(BasePage):
         self.headline("Modeling & Analysis")
 
         top = ttk.Frame(self); top.grid(row=1, column=0, sticky="ew", pady=(0,8))
-        ttk.Button(top, text="Compute from current data", command=self.render).grid(row=0, column=0, sticky="w")
         self.status_lbl = ttk.Label(top, text="", foreground="#6B7280")
-        self.status_lbl.grid(row=0, column=1, sticky="w", padx=12)
+        self.status_lbl.grid(row=0, column=0, sticky="w", padx=12)
 
-        self.fig = None
-        self.canvas_widget = None
         area = ttk.Frame(self); area.grid(row=2, column=0, sticky="nsew")
         self.rowconfigure(2, weight=1); self.columnconfigure(0, weight=1)
-        self.canvas_container = area
+        
+        self.fig = Figure(figsize=(10, 6), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=area)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        
+        self._overlay_images = []
+        
+        self.ax.text(0.5, 0.5, "Load data and select a model to see predictions", 
+                    ha="center", va="center", fontsize=12, color='#6B7280')
+        self.ax.axis("off")
+        self.fig.tight_layout()
+        self.canvas.draw()
 
-    def render(self):
-        if not DATA.od or len(DATA.od) < 400:
-            self.status_lbl.config(text="Load a CSV with at least a few hundred samples.")
+    def update_confidence_timeline(self):
+        if not DATA.od or len(DATA.od) < 100:
+            messagebox.showinfo("No Data", "Please load data first (at least 100 samples).")
             return
-        fe = FeatureEngine(np.array(DATA.od), window=30, fs=1.0)
-        fig = fe.fig_sixpack()
-
-        if self.canvas_widget:
-            self.canvas_widget.get_tk_widget().destroy()
-        self.fig = fig
-        canvas = FigureCanvasTkAgg(fig, master=self.canvas_container)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-        self.canvas_widget = canvas
-        self.status_lbl.config(text="Analysis updated.")
+        
+        if DATA.model is None:
+            messagebox.showinfo("No Model", "Please select a model first.")
+            return
+        
+        App.status("Computing confidence timeline...")
+        
+        self._overlay_images.clear()
+        self.ax.clear()
+        
+        ws = DATA.window_size
+        num_windows = len(DATA.od) // ws
+        
+        if num_windows < 1:
+            self.ax.text(0.5, 0.5, "Not enough data for the selected window size", 
+                        ha="center", va="center", fontsize=12)
+            self.ax.axis("off")
+            self.canvas.draw()
+            return
+        
+        confidences = []
+        window_times = []
+        
+        if not DATA.ts_dt:
+            DATA.ts_dt = pd.to_datetime(DATA.ts, errors='coerce').tolist()
+            if not DATA.ts_dt or all(pd.isna(t) for t in DATA.ts_dt):
+                DATA.ts_dt = [pd.Timestamp.now() + pd.Timedelta(seconds=i) for i in range(len(DATA.od))]
+        
+        for i in range(num_windows):
+            start_idx = i * ws
+            end_idx = start_idx + ws
+            window = DATA.od[start_idx:end_idx]
+            
+            mid_idx = start_idx + ws // 2
+            if mid_idx < len(DATA.ts_dt) and DATA.ts_dt[mid_idx] is not None:
+                window_times.append(DATA.ts_dt[mid_idx])
+            elif len(DATA.ts_dt) > 0:
+                valid_ts = [t for t in DATA.ts_dt if t is not None and pd.notna(t)]
+                if valid_ts:
+                    window_times.append(valid_ts[-1])
+                else:
+                    window_times.append(pd.Timestamp.now())
+            else:
+                window_times.append(pd.Timestamp.now())
+            
+            features_dict = DATA.extract_features(window)
+            X = pd.DataFrame([features_dict])
+            
+            proba = DATA.model.predict_proba(X)
+            chatter_conf = proba[0][1] * 100
+            confidences.append(chatter_conf)
+        
+        self.ax.plot(window_times, confidences, linewidth=2, color='#2563EB', 
+                    label='Chatter Likelihood (%)', zorder=10)
+        
+        self.ax.axhline(y=50, color='gray', linestyle='--', linewidth=1, 
+                       alpha=0.5, label='Decision Boundary', zorder=5)
+        
+        if DATA.classes:
+            y_min, y_max = self.ax.get_ylim()
+            
+            for seg in DATA.classes:
+                if seg["label"] not in VISIBLE_CLASSES:
+                    continue
+                
+                start_time = seg["start"]
+                end_time = seg["end"]
+                
+                color = CLASS_COLORS.get(seg["label"], "#BBBBBB")
+                
+                self.ax.axvspan(start_time, end_time, 
+                              facecolor=color, alpha=0.25, 
+                              linewidth=0, zorder=1)
+        
+        self.ax.set_xlabel('Time', fontsize=11)
+        self.ax.set_ylabel('Chatter Likelihood (%)', fontsize=11)
+        self.ax.set_title(f'Chatter Confidence in each Window over Time (Window Size: {ws} samples)', 
+                         fontsize=12, fontweight='bold')
+        self.ax.legend(loc='upper right', fontsize=9)
+        self.ax.grid(True, alpha=0.3, zorder=0)
+        self.ax.set_ylim([0, 105])
+        
+        legend_elements = []
+        for name, color in CLASS_COLORS.items():
+            if name in VISIBLE_CLASSES:
+                from matplotlib.patches import Patch
+                legend_elements.append(Patch(facecolor=color, alpha=0.25, label=name))
+        
+        if legend_elements:
+            second_legend = self.ax.legend(handles=legend_elements, 
+                                          loc='upper left', 
+                                          fontsize=8, 
+                                          title='Wave Classes')
+            self.ax.add_artist(second_legend)
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+        
+        self.status_lbl.config(text=f"Timeline updated: {num_windows} windows analyzed")
+        App.status(f"Confidence timeline computed for {num_windows} windows")
 
 class CorrelationWindow(tk.Toplevel):
     def __init__(self, parent):
