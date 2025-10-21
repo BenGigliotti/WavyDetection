@@ -1357,8 +1357,6 @@ class LiveTimeSeries(ttk.Frame):
             self.ax.plot(x, sm, linewidth=2.0, label="smooth")
 
         # class shading (convert global i0/i1 to local indices)
-        # class shading (convert global i0/i1 to local indices)
-        # class shading (convert global i0/i1 to local indices)
         if getattr(DATA, "classes", None):
             n_total = len(DATA.od)
             offset = n_total - len(y)
@@ -1373,20 +1371,42 @@ class LiveTimeSeries(ttk.Frame):
                 i0 = max(0, min(i0, len(y) - 2))
                 i1 = max(i0 + 1, min(i1, len(y) - 1))
 
-                c = CLASS_COLORS.get(seg["label"], "#BBBBBB")  # <-- this was missing
+                c = CLASS_COLORS.get(seg["label"], "#BBBBBB")
                 self.ax.axvspan(i0, i1, facecolor=c, alpha=0.25, linewidth=0)
-
+                
+                # Add label text on the overlay
+                self.ax.text(i0 + 2, self.ax.get_ylim()[1] * 0.95, seg["label"], 
+                           fontsize=8, color='#333333', weight='bold')
 
         self.ax.set_title("OD vs Samples — live")
-        self.ax.set_xlabel("sample index"); self.ax.set_ylabel("OD (inches)")
-        self.ax.legend(loc="upper left", fontsize=8)
+        self.ax.set_xlabel("sample index")
+        self.ax.set_ylabel("OD (inches)")
+        
+        # Create legend with both line plots AND class overlays
+        handles, labels = self.ax.get_legend_handles_labels()
+        
+        # Add class colors to legend
+        if getattr(DATA, "classes", None):
+            from matplotlib.patches import Patch
+            for name, color in CLASS_COLORS.items():
+                if name in VISIBLE_CLASSES:
+                    handles.append(Patch(facecolor=color, alpha=0.25, label=name))
+                    labels.append(name)
+        
+        self.ax.legend(handles, labels, loc="upper left", fontsize=8)
         self.fig.tight_layout()
         self.canvas.draw()
 
     def _tick(self):
-        if len(DATA.od) != self._last_len:
+        current_len = len(DATA.od)
+        current_classes = len(DATA.classes) if hasattr(DATA, 'classes') else 0
+        
+        if (current_len != self._last_len or 
+            current_classes != getattr(self, '_last_classes_len', -1)):
             self._draw()
-            self._last_len = len(DATA.od)
+            self._last_len = current_len
+            self._last_classes_len = current_classes
+        
         self.after(1000, self._tick)
 
 class ResultsPage(BasePage):
