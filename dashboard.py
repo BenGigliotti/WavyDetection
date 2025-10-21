@@ -1034,7 +1034,7 @@ class DataPage(BasePage):
         
         ttk.Label(controls, text="Compare to:").grid(row=0, column=8, sticky="w", padx=(0,4))
         self.sheet_var = tk.StringVar(value="Select sheet...")
-        self.sheet_dropdown = ttk.Combobox(controls, textvariable=self.sheet_var, state="disabled", width=25)
+        self.sheet_dropdown = ttk.Combobox(controls, textvariable=self.sheet_var, state="disabled", width=25, height=25)
         self.sheet_dropdown.grid(row=0, column=9, sticky="w", padx=(0,8))
         self.sheet_dropdown.bind('<<ComboboxSelected>>', self.on_sheet_select)
         
