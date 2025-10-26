@@ -866,9 +866,9 @@ class Gauge(ttk.Frame):
     def _draw_static(self):
         w, h = self.width, self.height
         cx, cy, r = w//2, h-10, min(w, h*2)//2 - 10
-        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=180, extent=60, fill="#16A34A", outline="")
-        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=240, extent=60, fill="#D97706", outline="")
-        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=300, extent=60, fill="#DC2626", outline="")
+        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=180, extent=-60, fill="#16A34A", outline="")
+        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=120, extent=-60, fill="#D97706", outline="")
+        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=60, extent=-60, fill="#DC2626", outline="")
         for i in range(0, 11):
             ang = math.radians(180 + i*18)
             x0 = cx + (r-18)*math.cos(ang); y0 = cy + (r-18)*math.sin(ang)
