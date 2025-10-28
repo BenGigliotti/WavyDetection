@@ -9,8 +9,10 @@ sample_rate = 2400
 mean_od = 0.5
 od_deviation = 0.4
 
+port = 6467
+
 async def generate_random_measurements(od, speed):
-    if random.random() > 0.99:
+    if random.random() > 0.9999:
         if speed != 0:
             speed = 0
         else:
@@ -40,7 +42,7 @@ async def send_output(websocket):
 
 
 async def main():
-    async with serve(send_output, "localhost", 6467) as server:
+    async with serve(send_output, "localhost", port) as server:
         await server.serve_forever()
 
 if __name__ == "__main__":
