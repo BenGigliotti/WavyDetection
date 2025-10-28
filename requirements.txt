@@ -6,3 +6,4 @@ scikit_learn==1.7.2
 seaborn==0.13.2
 xgboost==3.1.0
 openpyxl==3.1.5
+websockets==15.0.1
