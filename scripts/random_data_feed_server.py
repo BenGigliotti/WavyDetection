@@ -18,7 +18,7 @@ state_lock = asyncio.Lock()
 async def generate_random_measurements():
     global current_od, current_speed
 
-    if random.random() > 0.999:
+    if random.random() > 0.99:
         if current_speed != 0:
             current_speed = 0
         else:

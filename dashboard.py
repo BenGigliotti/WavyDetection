@@ -10,12 +10,13 @@ from datetime import datetime
 import numpy as np, pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
 import pickle
 from PIL import Image, ImageTk
+import threading, asyncio, json, queue, time
+try:
+    from websockets.asyncio.client import connect as ws_connect
+except Exception:
+    ws_connect = None
 
 APP_TITLE   = "Wavy Detection Prototype Dashboard"
 APP_VERSION = "v0.5"
@@ -156,6 +157,16 @@ class DataStore:
         self.window_size = None
 
         self.available_sheets = []
+
+        self.live_url = "ws://localhost:6467"
+        self.live_thread = None
+        self.live_stop = threading.Event()
+        self.live_queue = queue.Queue(maxsize=10000)
+
+        self._decim_current_sec = None
+        self._decim_vals = []
+        self._decim_speed_ok = False
+        self.target_hz = 1  # you can make this configurable later
 
 
     def _read_any_table(self, path: str, sheet = None):
@@ -612,6 +623,11 @@ class DataStore:
         if self.model is None:
             App.status("No model selected. Please select a model first.")
             return
+        if window_size is None or window_size <= 0:
+            App.status("Invalid window size.")
+            return
+        if len(self.od) < window_size:
+            return
         
         # Clear existing classes
         self.classes = []
@@ -640,6 +656,8 @@ class DataStore:
         # X_scaled = scaler.fit_transform(X)
         
         # Predict for all windows
+        if not features_list:
+            return
         probas = self.model.predict_proba(X)
         
         # Create class segments
@@ -648,7 +666,7 @@ class DataStore:
             
             self.classes.append({
                 "start": self.ts[start_idx],
-                "end": self.ts[end_idx],
+                "end": self.ts[end_idx - 1] if end_idx > 0 else self.ts[0],
                 "label": self.get_label_from_risk_prob(chatter_confidence),
                 "i0": start_idx,
                 "i1": end_idx,
@@ -844,6 +862,80 @@ class DataStore:
 
         self.classes = spans
         App.status(f"Classes loaded: {len(self.classes)} span(s).")
+
+
+    def _append_sample(self, ts_dt, od):
+        self.ts_dt.append(ts_dt)
+        self.ts.append(str(ts_dt))
+        self.od.append(float(od))
+
+    def _consume_live_queue(self):
+        """Called from the UI thread (poll) to drain queue and decimate to ~1 Hz."""
+        drained = 0
+        while True:
+            try:
+                item = self.live_queue.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+            ts, od, speed = item  # ts is a float seconds since epoch
+            # Build 1-second buckets and keep median od while speed>1
+            sec = int(ts)
+            if self._decim_current_sec is None:
+                self._decim_current_sec = sec
+                self._decim_vals = []
+                self._decim_speed_ok = False
+
+            if sec != self._decim_current_sec:
+                # flush previous second
+                if self._decim_speed_ok and self._decim_vals:
+                    median_od = float(np.median(self._decim_vals))
+                    self._append_sample(pd.to_datetime(self._decim_current_sec, unit="s"), median_od)
+                # start next bucket
+                self._decim_current_sec = sec
+                self._decim_vals = []
+                self._decim_speed_ok = False
+
+            if speed is not None and speed > 1:
+                self._decim_speed_ok = True
+                self._decim_vals.append(od)
+
+        # end-of-batch: if we changed buckets above, we’ve already flushed.
+        return drained
+
+    def start_live(self, url: str):
+        if ws_connect is None:
+            raise RuntimeError("websockets is not available. Install `websockets` >= 12.")
+        if self.live_thread and self.live_thread.is_alive():
+            return
+        self.live_url = url
+        self.live_stop.clear()
+        self.live_thread = threading.Thread(target=self._run_live_loop, daemon=True)
+        self.live_thread.start()
+
+    def stop_live(self):
+        self.live_stop.set()
+
+    def _run_live_loop(self):
+        asyncio.run(self._live_main())
+
+    async def _live_main(self):
+        while not self.live_stop.is_set():
+            try:
+                async with ws_connect(self.live_url) as ws:
+                    while not self.live_stop.is_set():
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        # server sends {"od": float, "speed": int}
+                        od = float(data.get("od", "nan"))
+                        speed = data.get("speed", None)
+                        ts = time.time()
+                        try:
+                            self.live_queue.put_nowait((ts, od, speed))
+                        except queue.Full:
+                            pass
+            except Exception:
+                await asyncio.sleep(0.5)
 
 
 DATA = DataStore()
@@ -1048,6 +1140,15 @@ class DataPage(BasePage):
         self.columnconfigure(0, weight=1); self.rowconfigure(3, weight=1)
         self.placeholder(table_area, "Recent files & preview table will appear here.")
 
+        ttk.Label(controls, text="WebSocket URL:").grid(row=1, column=0, sticky="w", pady=(6,0))
+        self.ws_url = tk.StringVar(value="ws://localhost:6467")
+        ttk.Entry(controls, textvariable=self.ws_url, width=40).grid(row=1, column=1, sticky="w", pady=(6,0), padx=(0,8))
+
+        ttk.Button(controls, text="Connect Live", command=self.connect_live).grid(row=1, column=2, sticky="w", pady=(6,0), padx=(0,8))
+        ttk.Button(controls, text="Disconnect",  command=self.disconnect_live).grid(row=1, column=3, sticky="w", pady=(6,0))
+
+        self.after(200, self._poll_live_queue)
+
     def load_xlsx(self):
         path = filedialog.askopenfilename(
             title="Select XLSX file",
@@ -1151,6 +1252,38 @@ class DataPage(BasePage):
         except Exception as e:
             messagebox.showerror("Load from Features failed", str(e)); App.status("Load from features failed")
 
+    def connect_live(self):
+        try:
+            DATA.start_live(self.ws_url.get().strip())
+            self.info.config(text=f"Live: connected to {self.ws_url.get().strip()}")
+            App.status("Live feed connected")
+        except Exception as e:
+            messagebox.showerror("Live Connect failed", str(e))
+            App.status("Live connect failed")
+
+    def disconnect_live(self):
+        DATA.stop_live()
+        self.info.config(text=f"{self.info.cget('text')}  •  live stopped")
+        App.status("Live feed disconnected")
+
+    def _poll_live_queue(self):
+        # Drain queue and append decimated samples; keep UI snappy
+        got = DATA._consume_live_queue()
+        # If a model is selected, you can auto-update classes here, e.g. re-run on latest slice.
+        # For efficiency, do this on a cadence or on a fixed “latest N” buffer, not every single tick.
+        if got and DATA.model is not None and DATA.window_size and len(DATA.od) >= DATA.window_size:
+            # Option A: run every second (simple debounce)
+            now = time.time()
+            if not hasattr(self, "_last_cls_ts") or now - self._last_cls_ts >= 1.0:
+                DATA.auto_classify(DATA.window_size)
+                self._last_cls_ts = now
+                app_instance = self.winfo_toplevel()
+                if hasattr(app_instance, 'pages') and 'Analysis' in app_instance.pages:
+                    analysis_page = app_instance.pages['Analysis']
+                    analysis_page.update_confidence_timeline()
+
+        self.after(100, self._poll_live_queue)
+
 class ModelPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
@@ -1208,8 +1341,8 @@ class ModelPage(BasePage):
             App.status(f"Model changed and classifications updated")
 
     def update_confidence_plot(self):
-        if not DATA.od or len(DATA.od) < 100:
-            messagebox.showinfo("No Data", "Please load data first (at least 100 samples).")
+        if not DATA.od:
+            messagebox.showinfo("No Data", "Please load data first")
             return
         
         App.status("Computing confidence curves... this may take a moment")
@@ -1531,8 +1664,8 @@ class AnalysisPage(BasePage):
         self.canvas.draw()
 
     def update_confidence_timeline(self):
-        if not DATA.od or len(DATA.od) < 100:
-            messagebox.showinfo("No Data", "Please load data first (at least 100 samples).")
+        if not DATA.od:
+            messagebox.showinfo("No Data", "Please load data first")
             return
         
         if DATA.model is None:
