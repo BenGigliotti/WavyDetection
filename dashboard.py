@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 import numpy as np, pandas as pd
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 import pickle
 from PIL import Image, ImageTk
@@ -1469,10 +1469,71 @@ class LiveTimeSeries(ttk.Frame):
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        tbar = ttk.Frame(self); tbar.pack(fill="x")
+        self.toolbar = NavigationToolbar2Tk(self.canvas, tbar)
+
+        self._user_view_active = False
+        self._saved_xlim = None
+        self._saved_ylim = None
+
+        def _on_mouse(event):
+            try:
+                mode = getattr(self.toolbar, "mode", "")
+            except Exception:
+                mode = ""
+            if event.inaxes is self.ax and mode in ("zoom rect", "pan/zoom"):
+                self._user_view_active = True
+                self._saved_xlim = self.ax.get_xlim()
+                self._saved_ylim = self.ax.get_ylim()
+
+        self.canvas.mpl_connect("button_release_event", _on_mouse)
+        self.canvas.mpl_connect("scroll_event", lambda e: (
+            setattr(self, "_user_view_active", True),
+            setattr(self, "_saved_xlim", self.ax.get_xlim()),
+            setattr(self, "_saved_ylim", self.ax.get_ylim())
+        ))
+
+        def _home_wrapper(*args, **kwargs):
+            self.reset_view()
+            NavigationToolbar2Tk.home(self.toolbar)
+
+        try:
+            btn = (getattr(self.toolbar, "_buttons", {}).get("home")
+                or getattr(self.toolbar, "_buttons", {}).get("Home"))
+            if btn is not None:
+                btn.configure(command=_home_wrapper)
+        except Exception:
+            pass
+
         self._last_len = -1
+        self.toolbar.update()
         self.after(1000, self._tick)
+        
+
+    def reset_view(self):
+        """Return to autoscaling and clear any saved manual limits."""
+        self._user_view_active = False
+        self._saved_xlim = None
+        self._saved_ylim = None
+        try:
+            self.ax.relim()
+            self.ax.autoscale_view()
+        except Exception:
+            pass
+        self.canvas.draw_idle()
+        # If you have a toolbar present:
+        try:
+            self.toolbar.update()
+        except Exception:
+            pass
 
     def _draw(self):
+        if self._user_view_active:
+            xlim = self._saved_xlim or self.ax.get_xlim()
+            ylim = self._saved_ylim or self.ax.get_ylim()
+        else:
+            xlim = ylim = None
         self.ax.clear()
         if not DATA.od:
             self.ax.text(0.5,0.5,"(Load CSV to see live plot)", ha="center", va="center")
@@ -1525,10 +1586,26 @@ class LiveTimeSeries(ttk.Frame):
                 if name in VISIBLE_CLASSES:
                     handles.append(Patch(facecolor=color, alpha=0.25, label=name))
                     labels.append(name)
+
+        if self._user_view_active and xlim and ylim:
+            # Preserve user’s zoom/pan
+            try:
+                self.ax.set_xlim(xlim)
+                self.ax.set_ylim(ylim)
+            except Exception:
+                # If limits invalid due to data shrinking, fall back to autoscale
+                self._user_view_active = False
+                self._saved_xlim = self._saved_ylim = None
+                self.ax.relim(); self.ax.autoscale_view()
+        else:
+            # No manual interaction: autoscale to new data
+            self.ax.relim()
+            self.ax.autoscale_view()
         
         self.ax.legend(handles, labels, loc="upper left", fontsize=8)
         self.fig.tight_layout()
         self.canvas.draw()
+        self.toolbar.update()
 
     def _tick(self):
         current_len = len(DATA.od)
@@ -1537,6 +1614,7 @@ class LiveTimeSeries(ttk.Frame):
         if (current_len != self._last_len or 
             current_classes != getattr(self, '_last_classes_len', -1)):
             self._draw()
+            self.toolbar.update()
             self._last_len = current_len
             self._last_classes_len = current_classes
         
