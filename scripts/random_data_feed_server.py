@@ -11,37 +11,53 @@ od_deviation = 0.4
 
 port = 6467
 
-async def generate_random_measurements(od, speed):
-    if random.random() > 0.9999:
-        if speed != 0:
-            speed = 0
+current_od = mean_od
+current_speed = 0
+state_lock = asyncio.Lock()
+
+async def generate_random_measurements():
+    global current_od, current_speed
+
+    if random.random() > 0.999:
+        if current_speed != 0:
+            current_speed = 0
         else:
-            speed = random.randint(15,25)
+            current_speed = random.randint(15,25)
     
-    if speed != 0:
-        od = np.random.normal(mean_od, od_deviation)
+    if current_speed != 0:
+        new_od = np.random.normal(mean_od, od_deviation)
+        current_od = 0.95 * current_od + 0.05 * new_od
 
     return {
-        "od": od,
-        "speed": speed
+        "od": current_od,
+        "speed": current_speed
     }
+
+async def measurement_generator():
+    sleep_time = 1.0 / sample_rate
+    while True:
+        async with state_lock:
+            await generate_random_measurements()
+        await asyncio.sleep(sleep_time)
 
 async def send_output(websocket):
     sleep_time = 1.0 / sample_rate
-    current_od = mean_od
-    current_speed = 0
-    while True:
-        measurement = await generate_random_measurements(current_od, current_speed)
-        current_od = measurement['od']
-        current_speed = measurement['speed']
-        try: 
+    try:
+        while True:
+            async with state_lock:
+                measurement = {
+                    "od": current_od,
+                    "speed": current_speed
+                }
             await websocket.send(json.dumps(measurement))
-        except ConnectionClosed:
-            break
-        await asyncio.sleep(sleep_time)
+            await asyncio.sleep(sleep_time)
+    except ConnectionClosed:
+        pass
 
 
 async def main():
+    generator_task = asyncio.create_task(measurement_generator())
+    
     async with serve(send_output, "localhost", port) as server:
         await server.serve_forever()
 
