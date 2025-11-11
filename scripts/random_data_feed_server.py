@@ -7,7 +7,7 @@ import random
 
 sample_rate = 2400
 mean_od = 0.5
-od_deviation = 0.4
+od_deviation = 0.1
 
 port = 6467
 

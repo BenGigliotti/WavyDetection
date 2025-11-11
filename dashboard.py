@@ -167,6 +167,8 @@ class DataStore:
         self._decim_vals = []
         self._decim_speed_ok = False
         self.target_hz = 1  # you can make this configurable later
+        # Whether to decimate high-rate live data to 1 Hz (median per second)
+        self.decimate_enabled = True
 
 
     def _read_any_table(self, path: str, sheet = None):
@@ -870,7 +872,9 @@ class DataStore:
         self.od.append(float(od))
 
     def _consume_live_queue(self):
-        """Called from the UI thread (poll) to drain queue and decimate to ~1 Hz."""
+        """Called from the UI thread (poll) to drain queue. If decimation is enabled,
+        bucket samples into 1-second windows and append the median (≈1 Hz). If disabled,
+        append every sample at its native rate for high-resolution analysis (e.g., FFT)."""
         drained = 0
         while True:
             try:
@@ -879,7 +883,17 @@ class DataStore:
                 break
             drained += 1
             ts, od, speed = item  # ts is a float seconds since epoch
-            # Build 1-second buckets and keep median od while speed>1
+
+            if not getattr(self, "decimate_enabled", True):
+                # No decimation: append every sample
+                self._append_sample(pd.to_datetime(ts, unit="s"), od)
+                # Reset any pending decimation bucket so we don't emit a stale median later
+                self._decim_current_sec = None
+                self._decim_vals = []
+                self._decim_speed_ok = False
+                continue
+
+            # Decimation path (≈1 Hz via per-second median while speed>1)
             sec = int(ts)
             if self._decim_current_sec is None:
                 self._decim_current_sec = sec
@@ -1146,6 +1160,18 @@ class DataPage(BasePage):
 
         ttk.Button(controls, text="Connect Live", command=self.connect_live).grid(row=1, column=2, sticky="w", pady=(6,0), padx=(0,8))
         ttk.Button(controls, text="Disconnect",  command=self.disconnect_live).grid(row=1, column=3, sticky="w", pady=(6,0))
+        # Optional decimation toggle (default: on)
+        self.decimate_var = tk.BooleanVar(value=True)
+        def _on_decimate_toggle(*_):
+            # update global setting and clear any partial bucket
+            DATA.decimate_enabled = self.decimate_var.get()
+            DATA._decim_current_sec = None
+            DATA._decim_vals = []
+            DATA._decim_speed_ok = False
+            App.status(f"Decimation to 1 Hz {'enabled' if DATA.decimate_enabled else 'disabled'}")
+        self.decimate_var.trace_add('write', _on_decimate_toggle)
+        ttk.Checkbutton(controls, text="Decimate live data to 1 Hz (median)", variable=self.decimate_var).grid(row=1, column=4, sticky="w", pady=(6,0), padx=(8,0))
+
 
         self.after(200, self._poll_live_queue)
 
@@ -1267,7 +1293,7 @@ class DataPage(BasePage):
         App.status("Live feed disconnected")
 
     def _poll_live_queue(self):
-        # Drain queue and append decimated samples; keep UI snappy
+        # Drain queue and append samples; decimation optional via checkbox; keep UI snappy
         got = DATA._consume_live_queue()
         # If a model is selected, you can auto-update classes here, e.g. re-run on latest slice.
         # For efficiency, do this on a cadence or on a fixed “latest N” buffer, not every single tick.
@@ -1540,7 +1566,7 @@ class LiveTimeSeries(ttk.Frame):
             self.ax.axis("off")
             self.canvas.draw(); return
 
-        y = np.asarray(DATA.od[-2400:])  # last ~2400 samples
+        y = np.asarray(DATA.od[-24000:])  # last ~2400 samples
         x = np.arange(len(y))
         self.ax.plot(x, y, linewidth=1.0, alpha=0.7, label="OD")
 
@@ -1686,9 +1712,9 @@ class HistoryPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
         self.headline("Historical Trend")
-        desc = "Trend view shows last N samples with smoothed curve and class overlays.\n" \
-               "Use this to see if the process is drifting toward NG before defects happen."
-        ttk.Label(self, text=desc, foreground="#6B7280").grid(row=1, column=0, sticky="w", pady=(0,8))
+        # desc = "Trend view shows last N samples with smoothed curve and class overlays.\n" \
+        #        "Use this to see if the process is drifting toward NG before defects happen."
+        ttk.Label(self, foreground="#6B7280").grid(row=1, column=0, sticky="w", pady=(0,8))
 
         grid = ttk.Frame(self); grid.grid(row=2, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1); self.rowconfigure(2, weight=1)
@@ -1699,10 +1725,10 @@ class HistoryPage(BasePage):
 
         side = ttk.Frame(grid); side.grid(row=0, column=1, sticky="nsew", padx=(8,0))
         side.columnconfigure(0, weight=1)
-        ttk.Label(side, text="Latest Stats", style="Subhead.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6))
-        self.l_slope = ttk.Label(side, text="Slope: —", style="KPI.TLabel"); self.l_slope.grid(row=1, column=0, sticky="w", pady=4)
-        self.l_p2p   = ttk.Label(side, text="Peak-to-peak: —", style="KPI.TLabel"); self.l_p2p.grid(row=2, column=0, sticky="w", pady=4)
-        self.l_score = ttk.Label(side, text="Risk score: —", style="KPI.TLabel"); self.l_score.grid(row=3, column=0, sticky="w", pady=4)
+        # ttk.Label(side, text="Latest Stats", style="Subhead.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6))
+        # self.l_slope = ttk.Label(side, text="Slope: —", style="KPI.TLabel"); self.l_slope.grid(row=1, column=0, sticky="w", pady=4)
+        # self.l_p2p   = ttk.Label(side, text="Peak-to-peak: —", style="KPI.TLabel"); self.l_p2p.grid(row=2, column=0, sticky="w", pady=4)
+        # self.l_score = ttk.Label(side, text="Risk score: —", style="KPI.TLabel"); self.l_score.grid(row=3, column=0, sticky="w", pady=4)
 
         self.after(1000, self._tick)
 
@@ -1710,9 +1736,9 @@ class HistoryPage(BasePage):
         slope = DATA.trend_slope(1024)
         p2p   = DATA.volatility_p2p(1024)
         score = DATA.ng_score(1024, spec_mm=10.0, spec_band=0.02)
-        self.l_slope.config(text=f"Slope: {slope:0.6f} in/sample")
-        self.l_p2p.config(text=f"Peak-to-peak: {p2p:0.4f} in")
-        self.l_score.config(text=f"Risk score: {score:0.1f}/100")
+        # self.l_slope.config(text=f"Slope: {slope:0.6f} in/sample")
+        # self.l_p2p.config(text=f"Peak-to-peak: {p2p:0.4f} in")
+        # self.l_score.config(text=f"Risk score: {score:0.1f}/100")
         self.chart.redraw()
         self.after(1000, self._tick)
 
