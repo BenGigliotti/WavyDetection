@@ -884,8 +884,11 @@ class DataStore:
             drained += 1
             ts, od, speed = item  # ts is a float seconds since epoch
 
+            # ---- NON-DECIMATED PATH ----
             if not getattr(self, "decimate_enabled", True):
-                # No decimation: append every sample
+                # Only keep samples while line is actually moving
+                if speed is None or speed <= 1:
+                    continue
                 self._append_sample(pd.to_datetime(ts, unit="s"), od)
                 # Reset any pending decimation bucket so we don't emit a stale median later
                 self._decim_current_sec = None
@@ -893,7 +896,7 @@ class DataStore:
                 self._decim_speed_ok = False
                 continue
 
-            # Decimation path (≈1 Hz via per-second median while speed>1)
+            # ---- DECIMATED PATH (≈1 Hz median, only if speed>1 in that second) ----
             sec = int(ts)
             if self._decim_current_sec is None:
                 self._decim_current_sec = sec
@@ -914,7 +917,6 @@ class DataStore:
                 self._decim_speed_ok = True
                 self._decim_vals.append(od)
 
-        # end-of-batch: if we changed buckets above, we’ve already flushed.
         return drained
 
     def start_live(self, url: str):
@@ -1676,12 +1678,19 @@ class ResultsPage(BasePage):
         self.pred_conf  = ttk.Label(right_top, text="Confidence: —", style="KPI.TLabel")
         self.pred_conf.pack(anchor="w")
 
-        self.after(1000, self._tick)
+        # NEW: FFT metric label just under Confidence
+        self.fft_metric = ttk.Label(
+            right_top,
+            text="FFT: —",
+            style="KPI.TLabel"
+        )
+        self.fft_metric.pack(anchor="w", pady=(2, 0))
 
+        self.after(1000, self._tick)
 
     def _tick(self):
         pct = 50
-        
+
         if DATA.od and DATA.classes:
             lbl, class_risk = DATA.current_class()
             if class_risk is not None:
@@ -1704,8 +1713,100 @@ class ResultsPage(BasePage):
             self.pred_conf.config(text="Please import data and select a model")
 
         self.gauge.set_value(pct)
+
+        # --- NEW: FFT-based “periodicity strength” metric ---
+        fft_info = self._compute_fft_metric(n=512)
+
+        if fft_info is None:
+            # No usable FFT
+            self.fft_metric.config(
+                text="FFT: inconclusive (not enough data or flat signal)"
+            )
+        elif not fft_info["periodic"]:
+            # FFT computed but no strong dominant peak
+            self.fft_metric.config(
+                text="FFT: inconclusive (no dominant periodic component)"
+            )
+        else:
+            # Clear harmonic found
+            self.fft_metric.config(
+                text=(
+                    f"FFT: peak power {fft_info['peak_power']:.3g} "
+                    f"at {fft_info['peak_freq']:.3g} Hz "
+                    f"(prominence {fft_info['prominence']*100:.1f}%)"
+                )
+            )
+
         self.after(1000, self._tick)
 
+    def _compute_fft_metric(self, n=512):
+        """
+        Look at the most recent n OD samples and compute:
+          - peak frequency (Hz)
+          - peak power (arbitrary units)
+          - prominence = peak_power / total_power in non-DC bins
+        Returns None if there isn't enough data or signal is degenerate.
+        """
+        if not DATA.od:
+            return None
+
+        y = np.asarray(DATA.recent_window(n), dtype=float)
+        if y.size < 16:
+            # too short for a meaningful FFT
+            return None
+
+        # Detrend by removing mean
+        y = y - np.mean(y)
+        if not np.any(np.isfinite(y)) or np.allclose(y, 0.0, atol=1e-12):
+            return None
+
+        # Estimate sampling period from timestamps (fallback to 1 Hz)
+        fs = 1.0
+        try:
+            if DATA.ts_dt and len(DATA.ts_dt) >= len(y):
+                t = pd.to_datetime(DATA.ts_dt[-len(y):], errors="coerce")
+                t = t[~pd.isna(t)]
+                if len(t) >= 2:
+                    dt_sec = np.median(
+                        np.diff(t).astype("timedelta64[ns]").astype(np.float64)
+                    ) / 1e9
+                    if dt_sec > 0:
+                        fs = 1.0 / dt_sec
+        except Exception:
+            pass
+
+        nfft = len(y)
+        freqs = np.fft.rfftfreq(nfft, d=1.0/fs)
+        fft_vals = np.fft.rfft(y)
+        psd = (np.abs(fft_vals)**2) / nfft
+
+        if psd.size <= 1:
+            return None
+
+        # Ignore DC component at index 0
+        psd_no_dc = psd[1:]
+        freqs_no_dc = freqs[1:]
+
+        peak_idx = int(np.argmax(psd_no_dc))
+        peak_freq = float(freqs_no_dc[peak_idx])
+        peak_power = float(psd_no_dc[peak_idx])
+        total_power = float(np.sum(psd_no_dc))
+
+        if not np.isfinite(peak_power) or total_power <= 0 or not np.isfinite(total_power):
+            return None
+
+        prominence = float(peak_power / total_power)
+
+        # Heuristic: require a reasonably dominant peak
+        periodic = prominence > 0.1
+
+        return {
+            "fs": fs,
+            "peak_freq": peak_freq,
+            "peak_power": peak_power,
+            "prominence": prominence,
+            "periodic": periodic,
+        }
 
 
 class HistoryPage(BasePage):
@@ -1753,124 +1854,226 @@ class AnalysisPage(BasePage):
 
         area = ttk.Frame(self); area.grid(row=2, column=0, sticky="nsew")
         self.rowconfigure(2, weight=1); self.columnconfigure(0, weight=1)
-        
-        self.fig = Figure(figsize=(10, 6), dpi=100)
+
+        # --- Existing figure: Confidence timeline of model output ---
+        self.fig = Figure(figsize=(10, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, master=area)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        
+
         self._overlay_images = []
-        
-        self.ax.text(0.5, 0.5, "Load data and select a model to see predictions", 
-                    ha="center", va="center", fontsize=12, color='#6B7280')
+
+        self.ax.text(0.5, 0.5, "Load data and select a model to see predictions",
+                     ha="center", va="center", fontsize=12, color='#6B7280')
         self.ax.axis("off")
         self.fig.tight_layout()
         self.canvas.draw()
+
+        # --- NEW: FFT figure: latest time window FFT ---
+        self.fft_fig = Figure(figsize=(10, 3), dpi=100)
+        self.fft_ax = self.fft_fig.add_subplot(111)
+        self.fft_canvas = FigureCanvasTkAgg(self.fft_fig, master=area)
+        self.fft_canvas.get_tk_widget().pack(fill="both", expand=True, pady=(8, 0))
+
+        self.fft_ax.text(0.5, 0.5, "FFT of latest window will appear here",
+                         ha="center", va="center", fontsize=11, color="#6B7280")
+        self.fft_ax.set_axis_off()
+        self.fft_fig.tight_layout()
+        self.fft_canvas.draw()
+
+        # Periodically refresh FFT so live feed is visible
+        self.after(1500, self._tick_fft)
+
+    def _tick_fft(self):
+        # update FFT plot even if no model is selected
+        self.update_fft_plot(n=512)
+        self.after(1500, self._tick_fft)
 
     def update_confidence_timeline(self):
         if not DATA.od:
             messagebox.showinfo("No Data", "Please load data first")
             return
-        
+
         if DATA.model is None:
             messagebox.showinfo("No Model", "Please select a model first.")
             return
-        
-        App.status("Computing confidence timeline...")
-        
+
+        App.status("Computing confidence timeline.")
+
         self._overlay_images.clear()
         self.ax.clear()
-        
+
         ws = DATA.window_size
         num_windows = len(DATA.od) // ws
-        
+
         if num_windows < 1:
-            self.ax.text(0.5, 0.5, "Not enough data for the selected window size", 
-                        ha="center", va="center", fontsize=12)
+            self.ax.text(0.5, 0.5, "Not enough data for the selected window size",
+                         ha="center", va="center", fontsize=12)
             self.ax.axis("off")
             self.canvas.draw()
             return
-        
+
         confidences = []
         window_times = []
-        
+
         if not DATA.ts_dt:
             DATA.ts_dt = pd.to_datetime(DATA.ts, errors='coerce').tolist()
             if not DATA.ts_dt or all(pd.isna(t) for t in DATA.ts_dt):
                 DATA.ts_dt = [pd.Timestamp.now() + pd.Timedelta(seconds=i) for i in range(len(DATA.od))]
-        
+
         for i in range(num_windows):
             start_idx = i * ws
             end_idx = start_idx + ws
+            if end_idx > len(DATA.od):
+                break
+
             window = DATA.od[start_idx:end_idx]
-            
-            mid_idx = start_idx + ws // 2
-            if mid_idx < len(DATA.ts_dt) and DATA.ts_dt[mid_idx] is not None:
-                window_times.append(DATA.ts_dt[mid_idx])
-            elif len(DATA.ts_dt) > 0:
-                valid_ts = [t for t in DATA.ts_dt if t is not None and pd.notna(t)]
-                if valid_ts:
-                    window_times.append(valid_ts[-1])
-                else:
-                    window_times.append(pd.Timestamp.now())
-            else:
-                window_times.append(pd.Timestamp.now())
-            
             features_dict = DATA.extract_features(window)
             X = pd.DataFrame([features_dict])
-            
-            proba = DATA.model.predict_proba(X)
-            chatter_conf = proba[0][1] * 100
-            confidences.append(chatter_conf)
-        
-        self.ax.plot(window_times, confidences, linewidth=2, color='#2563EB', 
-                    label='Chatter Likelihood (%)', zorder=10)
-        
-        self.ax.axhline(y=50, color='gray', linestyle='--', linewidth=1, 
-                       alpha=0.5, label='Decision Boundary', zorder=5)
-        
-        if DATA.classes:
-            y_min, y_max = self.ax.get_ylim()
-            
-            for seg in DATA.classes:
-                if seg["label"] not in VISIBLE_CLASSES:
-                    continue
-                
-                start_time = seg["start"]
-                end_time = seg["end"]
-                
-                color = CLASS_COLORS.get(seg["label"], "#BBBBBB")
-                
-                self.ax.axvspan(start_time, end_time, 
-                              facecolor=color, alpha=0.25, 
-                              linewidth=0, zorder=1)
-        
+            probas = DATA.model.predict_proba(X)
+            confidences.append(probas[0, 1] * 100)
+
+            # use timestamp at center of window for x-axis
+            mid_idx = start_idx + ws // 2
+            if mid_idx < len(DATA.ts_dt):
+                window_times.append(DATA.ts_dt[mid_idx])
+            else:
+                window_times.append(DATA.ts_dt[-1])
+
+        if not confidences:
+            self.ax.text(0.5, 0.5, "Not enough data to compute timeline",
+                         ha="center", va="center", fontsize=12)
+            self.ax.axis("off")
+            self.canvas.draw()
+            return
+
+        self.ax.plot(window_times, confidences, label="Chatter likelihood", color="#2563EB", linewidth=2)
+
+        # shaded class bands, if any
+        for span in getattr(DATA, "classes", []):
+            label = span.get("label", "UNCERTAIN")
+            color = CLASS_COLORS.get(label, "#BBBBBB")
+            start_time = span.get("start")
+            end_time = span.get("end")
+            if start_time is None or end_time is None:
+                continue
+            self.ax.axvspan(start_time, end_time,
+                            facecolor=pastel(color, 0.25),
+                            alpha=0.25,
+                            linewidth=0, zorder=0)
+
         self.ax.set_xlabel('Time', fontsize=11)
         self.ax.set_ylabel('Chatter Likelihood (%)', fontsize=11)
-        self.ax.set_title(f'Chatter Confidence in each Window over Time (Window Size: {ws} samples)', 
-                         fontsize=12, fontweight='bold')
-        self.ax.legend(loc='upper right', fontsize=9)
+        self.ax.set_title(f'Chatter Confidence in each Window over Time (Window Size: {ws} samples)',
+                          fontsize=12, fontweight='bold')
         self.ax.grid(True, alpha=0.3, zorder=0)
         self.ax.set_ylim([0, 105])
-        
-        legend_elements = []
+
+        # Legend for line + class colors
+        handles, labels = self.ax.get_legend_handles_labels()
+        from matplotlib.patches import Patch
         for name, color in CLASS_COLORS.items():
             if name in VISIBLE_CLASSES:
-                from matplotlib.patches import Patch
-                legend_elements.append(Patch(facecolor=color, alpha=0.25, label=name))
-        
-        if legend_elements:
-            second_legend = self.ax.legend(handles=legend_elements, 
-                                          loc='upper left', 
-                                          fontsize=8, 
-                                          title='Wave Classes')
-            self.ax.add_artist(second_legend)
-        
+                handles.append(Patch(facecolor=pastel(color, 0.25), label=name))
+                labels.append(name)
+        self.ax.legend(handles, labels, loc="upper right", fontsize=8)
+
         self.fig.tight_layout()
         self.canvas.draw()
-        
-        self.status_lbl.config(text=f"Timeline updated: {num_windows} windows analyzed")
-        App.status(f"Confidence timeline computed for {num_windows} windows")
+
+        self.status_lbl.config(text=f"Timeline updated: {len(confidences)} windows analyzed")
+        App.status(f"Confidence timeline computed for {len(confidences)} windows")
+
+    def update_fft_plot(self, n=512):
+        """
+        Plot FFT of the latest n OD samples in the bottom chart.
+        Shows 'inconclusive' style messages if there is not enough data or no clear peak.
+        """
+        self.fft_ax.clear()
+
+        if not DATA.od:
+            self.fft_ax.text(0.5, 0.5, "No data loaded",
+                             ha="center", va="center", fontsize=11)
+            self.fft_ax.set_axis_off()
+            self.fft_fig.tight_layout()
+            self.fft_canvas.draw()
+            return
+
+        y = np.asarray(DATA.recent_window(n), dtype=float)
+        if y.size < 16:
+            self.fft_ax.text(0.5, 0.5, "Not enough samples for FFT",
+                             ha="center", va="center", fontsize=11)
+            self.fft_ax.set_axis_off()
+            self.fft_fig.tight_layout()
+            self.fft_canvas.draw()
+            return
+
+        y = y - np.mean(y)
+        if not np.any(np.isfinite(y)) or np.allclose(y, 0.0, atol=1e-12):
+            self.fft_ax.text(0.5, 0.5, "FFT inconclusive (flat signal)",
+                             ha="center", va="center", fontsize=11)
+            self.fft_ax.set_axis_off()
+            self.fft_fig.tight_layout()
+            self.fft_canvas.draw()
+            return
+
+        # Estimate sampling rate from OD timestamps (fallback to 1 Hz)
+        fs = 1.0
+        try:
+            if DATA.ts_dt and len(DATA.ts_dt) >= len(y):
+                t = pd.to_datetime(DATA.ts_dt[-len(y):], errors="coerce")
+                t = t[~pd.isna(t)]
+                if len(t) >= 2:
+                    dt_sec = np.median(
+                        np.diff(t).astype("timedelta64[ns]").astype(np.float64)
+                    ) / 1e9
+                    if dt_sec > 0:
+                        fs = 1.0 / dt_sec
+        except Exception:
+            pass
+
+        nfft = len(y)
+        freqs = np.fft.rfftfreq(nfft, d=1.0/fs)
+        fft_vals = np.fft.rfft(y)
+        psd = (np.abs(fft_vals)**2) / nfft
+
+        if psd.size <= 1:
+            self.fft_ax.text(0.5, 0.5, "FFT inconclusive",
+                             ha="center", va="center", fontsize=11)
+            self.fft_ax.set_axis_off()
+            self.fft_fig.tight_layout()
+            self.fft_canvas.draw()
+            return
+
+        # Ignore DC bin when plotting and measuring
+        freqs_plot = freqs[1:]
+        psd_plot = psd[1:]
+
+        self.fft_ax.plot(freqs_plot, psd_plot)
+        self.fft_ax.set_xlabel("Frequency (Hz)")
+        self.fft_ax.set_ylabel("Power")
+        self.fft_ax.set_title("FFT of Latest Window")
+        self.fft_ax.grid(True, alpha=0.3)
+        self.fft_ax.set_axis_on()
+
+        # Highlight dominant frequency if clearly periodic
+        peak_idx = int(np.argmax(psd_plot))
+        peak_freq = float(freqs_plot[peak_idx])
+        peak_power = float(psd_plot[peak_idx])
+        total_power = float(np.sum(psd_plot))
+        prominence = peak_power / total_power if total_power > 0 else 0.0
+
+        if total_power > 0 and prominence > 0.30:
+            self.fft_ax.axvline(peak_freq, linestyle="--", alpha=0.7)
+            self.fft_ax.text(
+                peak_freq, peak_power,
+                f"{peak_freq:.3g} Hz",
+                rotation=90, va="bottom", ha="right", fontsize=9
+            )
+
+        self.fft_fig.tight_layout()
+        self.fft_canvas.draw()
+
 
 class CorrelationWindow(tk.Toplevel):
     def __init__(self, parent):
