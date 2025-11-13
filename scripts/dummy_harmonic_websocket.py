@@ -15,8 +15,8 @@ mean_od_mm = 12.7           # target OD
 drift_per_ft_mm = 0.000001     # slow drift per foot
 
 # Chatter patterns (spatial) along the tube
-chatter_wavelengths_in = [0.5, 2.0]  # inches
-chatter_amps_mm = [0.05, 0.02]       # mm
+chatter_wavelengths_in = [0.5, 2.0, 1.0]  # inches
+chatter_amps_mm = [0.05, 0.02, 0.1]       # mm
 
 noise_std_running = 0.005   # noise when line is moving [mm]
 noise_std_stopped = 0.0005  # noise when line is stopped [mm]

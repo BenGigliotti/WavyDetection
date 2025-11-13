@@ -1715,18 +1715,18 @@ class ResultsPage(BasePage):
         self.gauge.set_value(pct)
 
         # --- NEW: FFT-based “periodicity strength” metric ---
-        fft_info = self._compute_fft_metric(n=512)
+        fft_info = self._compute_fft_metric(n=24000)
 
         if fft_info is None:
             # No usable FFT
             self.fft_metric.config(
                 text="FFT: inconclusive (not enough data or flat signal)"
             )
-        elif not fft_info["periodic"]:
-            # FFT computed but no strong dominant peak
-            self.fft_metric.config(
-                text="FFT: inconclusive (no dominant periodic component)"
-            )
+        # elif not fft_info["periodic"]:
+        #     # FFT computed but no strong dominant peak
+        #     self.fft_metric.config(
+        #         text="FFT: inconclusive (no dominant periodic component)"
+        #     )
         else:
             # Clear harmonic found
             self.fft_metric.config(
@@ -1886,7 +1886,7 @@ class AnalysisPage(BasePage):
 
     def _tick_fft(self):
         # update FFT plot even if no model is selected
-        self.update_fft_plot(n=512)
+        self.update_fft_plot(n=24000)
         self.after(1500, self._tick_fft)
 
     def update_confidence_timeline(self):
