@@ -2,7 +2,7 @@
 # Wavy Detection — Prototype Dashboard with History/Trend + Data-driven Gauge
 # Built only with Python stdlib + numpy/pandas/matplotlib/sklearn.
 # Integrated waviness class overlays (from Streamlit app) for History & Results pages.
-
+import requests
 import os, math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -170,6 +170,68 @@ class DataStore:
         # Whether to decimate high-rate live data to 1 Hz (median per second)
         self.decimate_enabled = True
 
+        self.acme_base_url  = "http://localhost:8080"
+        self.acme_cse_base  = "/cse-in"
+        self.acme_ae        = "CMyApplication6"
+        self.acme_cnt       = "data"
+        self.acme_origin    = "CAdminAcme"
+
+        self._last_acme_ri  = None
+
+    def get_latest_acme(self):
+        """
+        Fetch the latest contentInstance from ACME and return:
+            batch: list[dict] of samples
+            ri:    resource ID of that CIN (so we can avoid re-reading it)
+        The bridge is posting batches as a JSON STRING in the 'con' field, e.g.
+            "[{\"t_stamp\": \"...\", \"od\": 12.7, \"speed\": 220.3}, ...]"
+        so we have to json.loads(con) first.
+        """
+        url = f'{self.acme_base_url}{self.acme_cse_base}/{self.acme_ae}/{self.acme_cnt}/la'
+        headers = {
+            "X-M2M-Origin": self.acme_origin,  # canonical header name
+            "X-M2M-RVI": "4",
+            "X-M2M-RI": f"get-la-{int(time.time() * 1000)}",
+            "Accept": "application/json",
+        }
+
+        try:
+            rp = requests.get(url, headers=headers, timeout=2)
+        except Exception:
+            # ACME down / network issue
+            return [], None
+
+        if rp.status_code != 200:
+            # e.g. 404 if container doesn't exist yet
+            return [], None
+
+        data = rp.json()
+        cin = data.get("m2m:cin", {})
+        ri = cin.get("ri")
+
+        # 'con' is a JSON-encoded string containing our batch
+        raw = cin.get("con")
+        if raw is None:
+            return [], ri
+
+        try:
+            batch = json.loads(raw)
+        except Exception:
+            # Fallbacks if ACME ever stores native JSON instead of a string
+            if isinstance(raw, dict):
+                batch = [raw]
+            elif isinstance(raw, list):
+                batch = raw
+            else:
+                return [], ri
+
+        # Normalize to list so caller can do "for item in batch"
+        if isinstance(batch, dict):
+            batch = [batch]
+
+        return batch, ri
+
+    
 
     def _read_any_table(self, path: str, sheet = None):
         """Return a pandas DataFrame from CSV/XLS/XLSX (first sheet for Excel)."""
@@ -872,31 +934,48 @@ class DataStore:
         self.od.append(float(od))
 
     def _consume_live_queue(self):
-        """Called from the UI thread (poll) to drain queue. If decimation is enabled,
-        bucket samples into 1-second windows and append the median (≈1 Hz). If disabled,
-        append every sample at its native rate for high-resolution analysis (e.g., FFT)."""
-        drained = 0
+        """Drain queue and append samples into DATA.od / ts_dt / ts.
+
+        - If decimation is disabled, append every sample while line speed>0.
+        - If decimation is enabled, bucket by second and append 1 median per sec.
+        """
+        drained  = 0
+        appended = 0
+
         while True:
             try:
                 item = self.live_queue.get_nowait()
             except queue.Empty:
                 break
-            drained += 1
-            ts, od, speed = item  # ts is a float seconds since epoch
 
-            # ---- NON-DECIMATED PATH ----
+            drained += 1
+            ts, od, speed = item  # ts is seconds since epoch (float)
+
+            # make speed a float if possible
+            if speed is not None:
+                try:
+                    speed = float(speed)
+                except Exception:
+                    speed = None
+
+            # ---------- NON-DECIMATED PATH ----------
             if not getattr(self, "decimate_enabled", True):
-                # Only keep samples while line is actually moving
-                if speed is None or speed <= 1:
+                # Only keep samples while the line is actually moving.
+                # (For debugging you can even remove this speed check.)
+                if speed is None or speed <= 0:
                     continue
-                self._append_sample(pd.to_datetime(ts, unit="s"), od)
-                # Reset any pending decimation bucket so we don't emit a stale median later
+
+                ts_dt = pd.to_datetime(ts, unit="s")
+                self._append_sample(ts_dt, od)
+                appended += 1
+
+                # Reset decimation bucket so it doesn't flush a stale median
                 self._decim_current_sec = None
                 self._decim_vals = []
                 self._decim_speed_ok = False
                 continue
 
-            # ---- DECIMATED PATH (≈1 Hz median, only if speed>1 in that second) ----
+            # ---------- DECIMATED PATH (≈1 Hz median) ----------
             sec = int(ts)
             if self._decim_current_sec is None:
                 self._decim_current_sec = sec
@@ -907,17 +986,25 @@ class DataStore:
                 # flush previous second
                 if self._decim_speed_ok and self._decim_vals:
                     median_od = float(np.median(self._decim_vals))
-                    self._append_sample(pd.to_datetime(self._decim_current_sec, unit="s"), median_od)
-                # start next bucket
+                    ts_dt = pd.to_datetime(self._decim_current_sec, unit="s")
+                    self._append_sample(ts_dt, median_od)
+                    appended += 1
+
+                # start new bucket
                 self._decim_current_sec = sec
                 self._decim_vals = []
                 self._decim_speed_ok = False
 
-            if speed is not None and speed > 1:
+            if speed is not None and speed > 0:
                 self._decim_speed_ok = True
                 self._decim_vals.append(od)
 
+        if appended:
+            # Debug so we can see growth in DATA.od
+            print(f"[LIVE] appended {appended} samples, total_len={len(self.od)}")
+
         return drained
+
 
     def start_live(self, url: str):
         if ws_connect is None:
@@ -934,6 +1021,76 @@ class DataStore:
 
     def _run_live_loop(self):
         asyncio.run(self._live_main())
+
+    def start_acme_live_stream(self):
+        if self.live_thread and self.live_thread.is_alive():
+            return
+        
+        self.live_stop.clear()
+        self.live_thread = threading.Thread(target=self._run_acme_loop, daemon=True)
+        self.live_thread.start()
+
+    def _run_acme_loop(self):
+        """Polling loop for ACME /la. Runs in its own thread."""
+        print("[ACME] live loop started")
+
+        while not self.live_stop.is_set():
+            try:
+                batch, ri = self.get_latest_acme()
+
+                # Nothing new yet
+                if not batch:
+                    time.sleep(0.1)
+                    continue
+
+                # Same CIN as last time – skip
+                if ri == self._last_acme_ri:
+                    time.sleep(0.1)
+                    continue
+
+                self._last_acme_ri = ri
+                now = time.time()
+
+                print(f"[ACME] got new CIN ri={ri}, batch_len={len(batch)}")
+
+                for item in batch:
+                    try:
+                        od = float(item.get("od", "nan"))
+                    except Exception:
+                        # bad / missing OD -> skip this sample
+                        print("[ACME] skipping item with bad 'od':", item)
+                        continue
+
+                    speed = item.get("speed", None)
+                    ts_str = item.get("t_stamp")
+
+                    if ts_str:
+                        try:
+                            # handle ...Z or +00:00
+                            ts_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                            ts = ts_dt.timestamp()
+                        except Exception:
+                            ts = now
+                    else:
+                        ts = now
+
+                    try:
+                        self.live_queue.put_nowait((ts, od, speed))
+                    except queue.Full:
+                        # If UI is too slow, just drop the oldest samples
+                        try:
+                            _ = self.live_queue.get_nowait()
+                            self.live_queue.put_nowait((ts, od, speed))
+                        except queue.Empty:
+                            pass
+
+            except Exception as e:
+                print("[ACME] loop error:", e)
+                time.sleep(0.5)
+
+            # Small pause so we don't hammer ACME
+            time.sleep(0.5)
+
 
     async def _live_main(self):
         while not self.live_stop.is_set():
@@ -1162,6 +1319,9 @@ class DataPage(BasePage):
 
         ttk.Button(controls, text="Connect Live", command=self.connect_live).grid(row=1, column=2, sticky="w", pady=(6,0), padx=(0,8))
         ttk.Button(controls, text="Disconnect",  command=self.disconnect_live).grid(row=1, column=3, sticky="w", pady=(6,0))
+        
+        ttk.Button(controls, text="Connect via ACME", command=self.connect_live_acme).grid(row=1, column=5, sticky="w", pady=(6,0), padx=(8,0))
+
         # Optional decimation toggle (default: on)
         self.decimate_var = tk.BooleanVar(value=True)
         def _on_decimate_toggle(*_):
@@ -1279,6 +1439,21 @@ class DataPage(BasePage):
             App.status(f"Classes (from features) loaded: {os.path.basename(path)}")
         except Exception as e:
             messagebox.showerror("Load from Features failed", str(e)); App.status("Load from features failed")
+
+    def connect_live_acme(self):
+        try:
+            # For ACME, start in non-decimated mode so every sample is plotted
+            DATA.decimate_enabled = False
+            if hasattr(self, "decimate_var"):
+                self.decimate_var.set(False)
+
+            DATA.start_acme_live_stream()
+            self.info.config(text=f"Live (ACME): reading from {DATA.acme_ae}/{DATA.acme_cnt}")
+            App.status("Live feed connected via ACME")
+        except Exception as e:
+            messagebox.showerror("ACME Live Connect failed", str(e))
+            App.status("ACME live connect failed")
+
 
     def connect_live(self):
         try:
