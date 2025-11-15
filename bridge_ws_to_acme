@@ -1,0 +1,69 @@
+import asyncio
+import json
+import time
+
+import requests
+import websockets
+
+# ---- ACME CONFIG ----
+BASE_URL   = "http://localhost:8080"
+CSE_BASE   = "/cse-in"
+AE_NAME    = "CMyApplication6"
+CNT_NAME   = "data"
+ORIGINATOR = "CAdminAcme"
+
+COMMON_HEADERS = {
+    "X-M2M-Origin": ORIGINATOR,
+    "X-M2M-RVI": "4",
+    "Accept": "application/json",
+}
+
+def send_batch_to_acme(batch):
+    """
+    Send a batch (list) of messages as one CIN to ACME.
+    We send JSON as a *string* and use cnf='text/plain:0'
+    because this ACME instance rejects 'application/json'.
+    """
+    url = f"{BASE_URL}{CSE_BASE}/{AE_NAME}/{CNT_NAME}"
+    headers = COMMON_HEADERS.copy()
+    headers["Content-Type"] = "application/json;ty=4"
+    headers["X-M2M-RI"] = f"cin-{int(time.time()*1000)}"
+
+    # Convert Python list -> JSON string
+    text_payload = json.dumps(batch)
+
+    body = {
+        "m2m:cin": {
+            "con": text_payload,      # JSON string
+            "cnf": "text/plain:0",    # this is what your CSE likes
+        }
+    }
+
+    resp = requests.post(url, headers=headers, json=body)
+    print("ACME POST:", resp.status_code, resp.text[:200])
+
+async def ws_to_acme_bridge():
+    uri = "ws://localhost:6467"
+    MAX_BATCH_SIZE = 100          # how many samples per CIN
+    MAX_BATCH_INTERVAL = 0.1      # seconds between sends
+
+    batch = []
+    last_send = time.time()
+
+    async with websockets.connect(uri) as websocket:
+        print("Connected to simulator websocket", uri)
+
+        async for message in websocket:
+            data = json.loads(message)   # {"t_stamp":..., "od":..., "speed":...}
+            batch.append(data)
+
+            now = time.time()
+            if (len(batch) >= MAX_BATCH_SIZE) or (now - last_send >= MAX_BATCH_INTERVAL):
+                # send and reset
+                send_batch_to_acme(batch)
+                batch = []
+                last_send = now
+
+
+if __name__ == "__main__":
+    asyncio.run(ws_to_acme_bridge())

@@ -1,0 +1,8 @@
+{
+  "m2m:ae": {
+    "rn": "CMyApplication6",
+    "api": "Nmy-application.example.com",
+    "rr": true,
+    "srv": ["4"]
+  }
+}
