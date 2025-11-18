@@ -3,29 +3,23 @@
 # Built only with Python stdlib + numpy/pandas/matplotlib/sklearn.
 # Integrated waviness class overlays (from Streamlit app) for History & Results pages.
 
-import os, csv, math, random, subprocess
+import os, math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 import numpy as np, pandas as pd
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
-
-# --- drop-in replacement for LiveTimeSeries ---
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-
-import matplotlib
-from matplotlib import dates as mdates
-from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk  # you already import this above; keep one
-
-
+from matplotlib.figure import Figure
+import pickle
+from PIL import Image, ImageTk
+import threading, asyncio, json, queue, time
+try:
+    from websockets.asyncio.client import connect as ws_connect
+except Exception:
+    ws_connect = None
 
 APP_TITLE   = "Wavy Detection Prototype Dashboard"
-APP_VERSION = "v0.4 (history+needle+class overlays)"
+APP_VERSION = "v0.5"
 
 # ---- Force the OD column by exact name ----
 EXACT_OD_COLUMN = "Tag_value"  # <- put your exact Excel header here
@@ -129,19 +123,6 @@ def normalize_label(s) -> str:
 VISIBLE_CLASSES = set(CLASS_COLORS.keys())
 
 # ========================= Utilities =========================
-def open_in_vscode(path="."):
-    try:
-        subprocess.Popen(["code", path]); return
-    except Exception:
-        pass
-    for c in [
-        r"C:\Users\%USERNAME%\AppData\Local\Programs\Microsoft VS Code\Code.exe",
-        r"C:\Program Files\Microsoft VS Code\Code.exe",
-        r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
-    ]:
-        exe = os.path.expandvars(c)
-        if os.path.exists(exe):
-            subprocess.Popen([exe, path]); return
 
 def pick(colnames, candidates):
     low = [c.lower() for c in colnames]
@@ -172,14 +153,32 @@ class DataStore:
         self.sec_vals = []    # list[float]
         self.paired_df = None # pandas DataFrame with columns ["od","sec","t"]
 
+        self.model = None
+        self.window_size = None
 
-    def _read_any_table(self, path: str):
+        self.available_sheets = []
+
+        self.live_url = "ws://localhost:6467"
+        self.live_thread = None
+        self.live_stop = threading.Event()
+        self.live_queue = queue.Queue(maxsize=10000)
+
+        self._decim_current_sec = None
+        self._decim_vals = []
+        self._decim_speed_ok = False
+        self.target_hz = 1  # you can make this configurable later
+        # Whether to decimate high-rate live data to 1 Hz (median per second)
+        self.decimate_enabled = True
+
+
+    def _read_any_table(self, path: str, sheet = None):
         """Return a pandas DataFrame from CSV/XLS/XLSX (first sheet for Excel)."""
         ext = os.path.splitext(path.lower())[1]
         if ext in [".xlsx", ".xls"]:
-            return pd.read_excel(path, sheet_name=0)
-        else:
-            return pd.read_csv(path)
+            if sheet == None:
+                return pd.read_excel(path, sheet_name=None, parse_dates=[0])
+            else:
+                return pd.read_excel(path, sheet_name=[sheet, 'YS_Pullout1_Act_Speed_fpm'], parse_dates=[0])
         
     def _smart_to_numeric(self, series: pd.Series) -> pd.Series:
         """
@@ -248,117 +247,68 @@ class DataStore:
         except Exception:
             pass
         return c
+    
+    def filter_by_speed(self, df_dict):
+        speed_df = df_dict['YS_Pullout1_Act_Speed_fpm']
+        
+        speed_threshold = 1
 
-    def load_data(self, path: str):
-        """Load time-series data from CSV/XLSX with robust time/OD detection."""
+        mask = speed_df['Tag_value'] > speed_threshold
+        filtered_speed = speed_df[mask]
+        valid_indices = filtered_speed.index
+        
+        filtered_dict = {}
+        for sheet_name, df in df_dict.items():
+            if len(df) == 0:
+                continue
+                
+            filtered_dict[sheet_name] = df.reindex(valid_indices).reset_index(drop=True)
+        
+        return filtered_dict
+
+    def load_data(self, path: str, app=None):
         if not os.path.exists(path):
             raise FileNotFoundError(path)
         
         self.path = path
 
-        df = self._read_any_table(path)
-        if df is None or df.empty:
-            raise ValueError("Empty file.")
-
-        cols = list(df.columns)
-        if not cols:
-            raise ValueError("No columns found.")
-
-        # --- Pick time column (prefer known names, e.g., t_stamp) ---
-        tcol = pick(cols, DATA_COL_GUESSES["time"]) or cols[0]
-
-        # --- Pick OD column ---
-        # 1) Try your previously preferred exact header (if you set one)
-        EXACT_OD_COLUMN = globals().get("EXACT_OD_COLUMN", None)
-        ENFORCE_EXACT_OD = globals().get("ENFORCE_EXACT_OD", False)
-
-        ycol = None
-        if EXACT_OD_COLUMN and EXACT_OD_COLUMN in df.columns:
-            ycol = EXACT_OD_COLUMN
+        ext = os.path.splitext(path.lower())[1]
+        if ext in [".xlsx", ".xls"]:
+            excel_file = pd.ExcelFile(path)
+            self.available_sheets = excel_file.sheet_names
         else:
-            # 2) Try alias list (includes Tag_value)
-            ycol = pick(cols, DATA_COL_GUESSES["od"])
+            self.available_sheets = []
 
-            # 3) If still unknown: choose the first numeric column that isn't the time column
-            if ycol is None:
-                for c in cols:
-                    if c != tcol and pd.api.types.is_numeric_dtype(df[c]):
-                        ycol = c
-                        break
+        df_dict = self._read_any_table(path, "NDC_System_OD_Value")
+        if df_dict is None or len(df_dict) == 0:
+            raise ValueError("Empty file.")
+        
+        filtered_df_dict = self.filter_by_speed(df_dict)
 
-            # 4) If still unknown and there are only 2 columns, pick the other one
-            if ycol is None and len(cols) == 2:
-                ycol = cols[0] if cols[1] == tcol else cols[1]
-
-            # If user insisted on exact name and we failed, raise a friendly error
-            if ENFORCE_EXACT_OD and EXACT_OD_COLUMN and ycol != EXACT_OD_COLUMN:
-                raise ValueError(
-                    f"Could not find OD column '{EXACT_OD_COLUMN}' in this file.\n"
-                    f"Columns present: {list(df.columns)}\n"
-                    f"Tip: set ENFORCE_EXACT_OD=False to let me auto-detect (will use '{ycol}')."
-                )
-
-        if ycol is None:
-            raise ValueError(
-                "Could not determine OD column.\n"
-                f"Columns present: {list(df.columns)}\n"
-                "Try renaming your OD column to one of: "
-                f"{DATA_COL_GUESSES['od']}"
-            )
-
-        # --- Coerce OD to numeric and drop NaNs; align TS accordingly ---
-        od_series = self._smart_to_numeric(df[ycol])
-        keep_mask = od_series.notna()
-        if keep_mask.sum() == 0:
-            raise ValueError(
-                f"OD column '{ycol}' parsed to all NaN. "
-                "Likely due to unexpected formatting. "
-                "Try opening the file and saving as CSV, or send a sample of the OD cells."
-            )
-
-        # Optional: if all zeros, warn loudly (this is what led to the flat line)
-        if (od_series[keep_mask] == 0).all():
-            raise ValueError(
-                f"OD column '{ycol}' parsed but all values are 0. "
-                "This usually means decimal commas/units weren’t handled—"
-                "please verify a few raw cell values.")
-
-        self.od = od_series[keep_mask].tolist()
-        self.ts = df.loc[keep_mask, tcol].astype(str).tolist()
+        self.od = filtered_df_dict['NDC_System_OD_Value']['Tag_value'].tolist()
+        self.ts = filtered_df_dict['NDC_System_OD_Value']['t_stamp'].astype(str).tolist()
+        self.ts_dt = pd.to_datetime(filtered_df_dict['NDC_System_OD_Value']['t_stamp'], errors='coerce').tolist()
 
         try:
-            v = od_series[keep_mask]
-            App.status(f"Using time='{tcol}', OD='{ycol}' • rows={len(v)} "
+            v = self.od
+            App.status(f"Using time='{'t_stamp'}', OD='{'Tag_value'}' • rows={len(v)} "
                     f"• min={v.min():.6g}, max={v.max():.6g}, mean={v.mean():.6g}")
         except Exception:
             pass
 
-
-        # timestamps (as strings for UI) for the same rows
-        self.ts = df.loc[keep_mask, tcol].astype(str).tolist()
-
-        # Parsed timestamps (for class index mapping); synthesize if mostly bad
-        try:
-            ts_dt = pd.to_datetime(df.loc[keep_mask, tcol], errors="coerce")
-        except Exception:
-            ts_dt = pd.Series([pd.NaT] * keep_mask.sum())
-
-        if ts_dt.isna().sum() > 0.9 * len(ts_dt):
-            base = pd.Timestamp.utcnow()
-            self.ts_dt = [base + pd.Timedelta(seconds=i) for i in range(len(self.od))]
-        else:
-            self.ts_dt = ts_dt.tolist()
-
         self.last_loaded_rows = len(self.od)
         self.path = path
 
-        # Optional: let the status bar show what we picked
         try:
-            App.status(f"Using time='{tcol}', OD='{ycol}'. Rows kept: {self.last_loaded_rows}.")
+            App.status(f"Using time='{'t_stamp'}', OD='{'Tag_value'}'. Rows kept: {self.last_loaded_rows}.")
         except Exception:
             pass
 
-        self.auto_classify(fs=1.0, win_sec=60, step_sec=30)
+        if self.model is not None and app is not None:
+            self.auto_classify(window_size=self.window_size)
+            if hasattr(app, 'pages') and 'Analysis' in app.pages:
+                analysis_page = app.pages['Analysis']
+                analysis_page.update_confidence_timeline()
 
             # Map labels -> an NG risk in [0..1] (tune if you like)
     CLASS_TO_RISK = {
@@ -412,64 +362,53 @@ class DataStore:
         paired = paired.dropna().reset_index(drop=True)
         return paired[["t","od","sec"]]
     
-    def load_secondary(self, path: str):
-        """
-        Load a second series (e.g., ovality), align it by time to the current OD,
-        and keep a paired DataFrame for correlation.
-        """
-        if not os.path.exists(path):
-            raise FileNotFoundError(path)
-        if not self.od:
-            raise ValueError("Load the OD data first.")
-
-        ext = os.path.splitext(path.lower())[1]
-        df_sec = pd.read_excel(path, sheet_name=0) if ext in [".xlsx", ".xls"] else pd.read_csv(path)
+    def load_secondary_sheet(self, sheet_name: str):
+        if not self.path:
+            raise ValueError("Load the main data file first.")
+        if not os.path.exists(self.path):
+            raise FileNotFoundError(self.path)
+        
+        ext = os.path.splitext(self.path.lower())[1]
+        if ext not in [".xlsx", ".xls"]:
+            raise ValueError("Secondary sheet loading only works with Excel files.")
+        
+        df_dict = pd.read_excel(self.path, sheet_name=[sheet_name, 'YS_Pullout1_Act_Speed_fpm'])
+        
+        df_sec = df_dict[sheet_name]
         if df_sec is None or df_sec.empty:
-            raise ValueError("Secondary file is empty.")
+            raise ValueError(f"Sheet '{sheet_name}' is empty.")
+        
+        filtered_dict = self.filter_by_speed(df_dict)
+        df_sec_filtered = filtered_dict[sheet_name]
 
-        # pick columns
-        cols_s = list(df_sec.columns)
-        tcol_s = pick(cols_s, SECONDARY_COL_GUESSES["time"]) or cols_s[0]
-        ycol_s = pick(cols_s, SECONDARY_COL_GUESSES["val"])
-        if ycol_s is None:
-            # fallback: first numeric column that isn't time
-            for c in cols_s:
-                if c != tcol_s and pd.api.types.is_numeric_dtype(df_sec[c]):
-                    ycol_s = c; break
-        if ycol_s is None:
-            raise ValueError(f"Could not find secondary value column. Columns: {cols_s}")
+        cols_s = list(df_sec_filtered.columns)
+        tcol_s = pick(cols_s, SECONDARY_COL_GUESSES["time"]) or "t_stamp"
+        ycol_s = pick(cols_s, SECONDARY_COL_GUESSES["val"]) or "Tag_value"
+        
+        if tcol_s not in cols_s:
+            raise ValueError(f"Could not find time column in sheet '{sheet_name}'. Columns: {cols_s}")
+        if ycol_s not in cols_s:
+            raise ValueError(f"Could not find value column in sheet '{sheet_name}'. Columns: {cols_s}")
 
-        # We need the original DF used to make OD. Re-read it to get chosen columns.
-        extm = os.path.splitext(self.path.lower())[1]
-        df_main = pd.read_excel(self.path, sheet_name=0) if extm in [".xlsx",".xls"] else pd.read_csv(self.path)
-        cols_m = list(df_main.columns)
-        tcol_m = pick(cols_m, DATA_COL_GUESSES["time"]) or cols_m[0]
+        df_dict_od = pd.read_excel(self.path, sheet_name=['NDC_System_OD_Value', 'YS_Pullout1_Act_Speed_fpm'])
+        filtered_dict_od = self.filter_by_speed(df_dict_od)
+        df_main_filtered = filtered_dict_od['NDC_System_OD_Value']
+        
+        tcol_m = "t_stamp"
+        ycol_m = "Tag_value"
 
-        # Which OD column did we actually use?
-        od_candidates = [globals().get("EXACT_OD_COLUMN", None)] + DATA_COL_GUESSES["od"]
-        od_candidates = [c for c in od_candidates if c]  # drop None
-        ycol_m = None
-        for c in od_candidates:
-            if c in df_main.columns:
-                ycol_m = c; break
-        if ycol_m is None:
-            # fall back to first numeric non-time
-            for c in cols_m:
-                if c != tcol_m and pd.api.types.is_numeric_dtype(df_main[c]):
-                    ycol_m = c; break
-
-        # get aligned pairs
-        paired = self._align_series(df_main, tcol_m, ycol_m, df_sec, tcol_s, ycol_s)
+        paired = self._align_series(df_main_filtered, tcol_m, ycol_m, 
+                                    df_sec_filtered, tcol_s, ycol_s)
         if paired.empty:
-            raise ValueError("No overlapping timestamps between OD and the secondary file.")
+            raise ValueError(f"No overlapping timestamps between OD and '{sheet_name}' after speed filtering.")
 
         self.paired_df = paired
-        self.sec_path = path
-        self.sec_name = os.path.basename(path)
+        self.sec_path = self.path
+        self.sec_name = sheet_name
         self.sec_ts_dt = paired["t"].tolist()
         self.sec_vals = paired["sec"].tolist()
 
-        App.status(f"Secondary loaded & aligned: {self.sec_name} • paired rows={len(self.paired_df)}")
+        App.status(f"Secondary loaded & aligned: {sheet_name} • paired rows={len(self.paired_df)} (speed filtered)")
 
     def corr_stats(self, max_lag_samples: int = 300):
         """
@@ -568,20 +507,9 @@ class DataStore:
         return self.ts_dt[-1]
 
     def current_class(self):
-        """
-        Return (label, risk_float) for the current timestamp, if it falls
-        inside a loaded class segment; else (None, None).
-        """
-        if not self.classes or not self.ts_dt:
+        if not self.classes:
             return None, None
-        t = self.ts_dt[-1]
-        # Fast path using precomputed i0..i1 spans
-        i_last = len(self.od) - 1
-        for seg in reversed(self.classes):
-            if seg["i0"] <= i_last < seg["i1"]:
-                lbl = seg["label"]
-                return lbl, self.CLASS_TO_RISK.get(lbl, 0.5)
-        return None, None
+        return self.classes[-1]["label"], self.classes[-1]["risk"]
 
     def load_classes_from_features(self, path: str):
         if not os.path.exists(path):
@@ -664,99 +592,89 @@ class DataStore:
         self.classes = spans
         App.status(f"Classes from features loaded: {len(self.classes)} spans.")
 
-    def auto_classify(self, fs=1.0, win_sec=60, step_sec=30):
-        """
-        Heuristic 5-class segmentation from the loaded OD signal.
-        Fills self.classes with spans having labels in:
-        STEADY, MILD_WAVE, STRONG_WAVE, DRIFT, BURSTY_NOISY
-        """
-        if not self.od:
-            self.classes = []
+    def extract_features(self, window_data):
+        mean_val = np.mean(window_data)
+        std_val = np.std(window_data)
+        # div by zero
+        if mean_val == 0:
+            mean_val = 1e-10
+        
+        # features are normalized to the mean here to take into account spans of multiple different tubing target sizes
+        features = {
+            'coef_variation': std_val / mean_val,  # coefficient of variation ak relative std
+            'relative_range': np.ptp(window_data) / mean_val,  # range relative to mean
+            'normalized_variance': np.var(window_data) / (mean_val ** 2),
+            'peak_to_peak_ratio': np.ptp(window_data) / np.abs(mean_val),
+            'relative_max_deviation': (np.max(window_data) - mean_val) / mean_val,
+            'relative_min_deviation': (mean_val - np.min(window_data)) / mean_val,
+            # differences between consecutive points, indicates smoothness
+            'mean_abs_diff': np.mean(np.abs(np.diff(window_data))) / mean_val,
+            'max_abs_diff': np.max(np.abs(np.diff(window_data))) / mean_val,
+        }
+        
+        return features
+    
+    def get_label_from_risk_prob(self, risk):
+        if   risk < 0.25: return "STEADY"
+        elif risk < 0.45: return "MILD_WAVE"
+        elif risk < 0.65: return "DRIFT"
+        elif risk < 0.80: return "BURSTY_NOISY"
+        else:             return "STRONG_WAVE"
+
+    def auto_classify(self, window_size=60):
+        if self.model is None:
+            App.status("No model selected. Please select a model first.")
             return
+        if window_size is None or window_size <= 0:
+            App.status("Invalid window size.")
+            return
+        if len(self.od) < window_size:
+            return
+        
+        # Clear existing classes
+        self.classes = []
+        
+        num_windows = len(self.od) // window_size
 
-        x = np.asarray(self.od, dtype=float)
-        n = len(x)
+        # Collect all features first
+        features_list = []
+        window_metadata = []  # Store start/end indices for each window
+        
+        for i in range(num_windows):
+            start_idx = i * window_size
+            end_idx = start_idx + window_size
+            window = self.od[start_idx:end_idx]
+            
+            # Extract features as a dictionary
+            features_dict = self.extract_features(window)
+            features_list.append(features_dict)
+            window_metadata.append((start_idx, end_idx))
+        
+        # Convert to DataFrame (same as training)
+        X = pd.DataFrame(features_list)
+        
+        # Scale all features at once (same as training)
+        # scaler = StandardScaler()
+        # X_scaled = scaler.fit_transform(X)
+        
+        # Predict for all windows
+        if not features_list:
+            return
+        probas = self.model.predict_proba(X)
+        
+        # Create class segments
+        for i, (start_idx, end_idx) in enumerate(window_metadata):
+            chatter_confidence = probas[i][1]  # Probability of class 1 (chatter/bad)
+            
+            self.classes.append({
+                "start": self.ts[start_idx],
+                "end": self.ts[end_idx - 1] if end_idx > 0 else self.ts[0],
+                "label": self.get_label_from_risk_prob(chatter_confidence),
+                "i0": start_idx,
+                "i1": end_idx,
+                "risk": chatter_confidence
+            })
 
-        # --- smooth baseline (robust moving average) ---
-        win = max(8, int(win_sec * fs))
-        step = max(1, int(step_sec * fs))
-        if win >= n:
-            win = max(8, n // 10)
-        baseline = pd.Series(x).rolling(win, min_periods=max(3, win//5)).mean().to_numpy()
-        baseline = np.nan_to_num(baseline, nan=np.nanmedian(x))
-        resid = x - baseline
-
-        # precompute window indices
-        starts = list(range(0, n - win + 1, step))
-        if not starts:
-            starts = [0]
-        stops = [min(s + win, n) for s in starts]
-
-        # features per window
-        feats = []
-        for s, e in zip(starts, stops):
-            y = x[s:e]
-            r = resid[s:e]
-
-            # slope on raw (trend)
-            k = len(y)
-            sx = k*(k-1)/2.0
-            sxx = k*(k-1)*(2*k-1)/6.0
-            sy = float(np.sum(y))
-            sxy = float(np.sum(np.arange(k)*y))
-            denom = k*sxx - sx*sx
-            slope = 0.0 if abs(denom) < 1e-12 else (k*sxy - sx*sy)/denom
-
-            r_ptp = float(np.max(r) - np.min(r))
-            r_mad = float(np.mean(np.abs(r - np.median(r))))
-            r_std = float(np.std(r))
-            # high-freq “noisiness” proxy
-            diff_std = float(np.std(np.diff(y))) if k > 2 else 0.0
-
-            feats.append((s, e, slope, r_ptp, r_mad, r_std, diff_std))
-
-        # robust thresholds from medians
-        abs_slopes = np.array([abs(f[2]) for f in feats])
-        r_ptps    = np.array([f[3] for f in feats])
-        r_mads    = np.array([f[4] for f in feats])
-        r_stds    = np.array([f[5] for f in feats])
-        dstds     = np.array([f[6] for f in feats])
-
-        eps = 1e-12
-        slope_thr = np.median(abs_slopes) + 3.0*np.median(np.abs(abs_slopes - np.median(abs_slopes)))
-        noise_thr = np.median(r_stds) + 2.5*np.median(np.abs(r_stds - np.median(r_stds)))
-        # wave thresholds based on residual amplitude
-        mild_thr   = np.median(r_ptps) + 1.5*np.median(np.abs(r_ptps - np.median(r_ptps)))
-        strong_thr = np.median(r_ptps) + 3.0*np.median(np.abs(r_ptps - np.median(r_ptps)))
-
-        spans = []
-        for (s, e, slope, r_ptp, r_mad, r_std, diff_std) in feats:
-            # decision order matters
-            if abs(slope) > max(slope_thr, 1e-9) and r_ptp < strong_thr:
-                lbl = "DRIFT"
-            elif r_std > noise_thr and r_ptp < strong_thr:
-                lbl = "BURSTY_NOISY"
-            elif r_ptp >= strong_thr:
-                lbl = "STRONG_WAVE"
-            elif r_ptp >= mild_thr:
-                lbl = "MILD_WAVE"
-            else:
-                lbl = "STEADY"
-
-            spans.append({"i0": int(s), "i1": int(e), "label": lbl,
-                          "start": self.ts_dt[s] if self.ts_dt else pd.NaT,
-                          "end":   self.ts_dt[e-1] if self.ts_dt else pd.NaT})
-
-        # Merge adjacent windows with the same label to make cleaner bands
-        merged = []
-        for seg in spans:
-            if not merged or seg["label"] != merged[-1]["label"] or seg["i0"] > merged[-1]["i1"]:
-                merged.append(seg)
-            else:
-                merged[-1]["i1"] = seg["i1"]
-                merged[-1]["end"] = seg["end"]
-
-        self.classes = merged
         App.status(f"Auto-classes computed: {len(self.classes)} span(s).")
 
 
@@ -948,6 +866,94 @@ class DataStore:
         App.status(f"Classes loaded: {len(self.classes)} span(s).")
 
 
+    def _append_sample(self, ts_dt, od):
+        self.ts_dt.append(ts_dt)
+        self.ts.append(str(ts_dt))
+        self.od.append(float(od))
+
+    def _consume_live_queue(self):
+        """Called from the UI thread (poll) to drain queue. If decimation is enabled,
+        bucket samples into 1-second windows and append the median (≈1 Hz). If disabled,
+        append every sample at its native rate for high-resolution analysis (e.g., FFT)."""
+        drained = 0
+        while True:
+            try:
+                item = self.live_queue.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+            ts, od, speed = item  # ts is a float seconds since epoch
+
+            # ---- NON-DECIMATED PATH ----
+            if not getattr(self, "decimate_enabled", True):
+                # Only keep samples while line is actually moving
+                if speed is None or speed <= 1:
+                    continue
+                self._append_sample(pd.to_datetime(ts, unit="s"), od)
+                # Reset any pending decimation bucket so we don't emit a stale median later
+                self._decim_current_sec = None
+                self._decim_vals = []
+                self._decim_speed_ok = False
+                continue
+
+            # ---- DECIMATED PATH (≈1 Hz median, only if speed>1 in that second) ----
+            sec = int(ts)
+            if self._decim_current_sec is None:
+                self._decim_current_sec = sec
+                self._decim_vals = []
+                self._decim_speed_ok = False
+
+            if sec != self._decim_current_sec:
+                # flush previous second
+                if self._decim_speed_ok and self._decim_vals:
+                    median_od = float(np.median(self._decim_vals))
+                    self._append_sample(pd.to_datetime(self._decim_current_sec, unit="s"), median_od)
+                # start next bucket
+                self._decim_current_sec = sec
+                self._decim_vals = []
+                self._decim_speed_ok = False
+
+            if speed is not None and speed > 1:
+                self._decim_speed_ok = True
+                self._decim_vals.append(od)
+
+        return drained
+
+    def start_live(self, url: str):
+        if ws_connect is None:
+            raise RuntimeError("websockets is not available. Install `websockets` >= 12.")
+        if self.live_thread and self.live_thread.is_alive():
+            return
+        self.live_url = url
+        self.live_stop.clear()
+        self.live_thread = threading.Thread(target=self._run_live_loop, daemon=True)
+        self.live_thread.start()
+
+    def stop_live(self):
+        self.live_stop.set()
+
+    def _run_live_loop(self):
+        asyncio.run(self._live_main())
+
+    async def _live_main(self):
+        while not self.live_stop.is_set():
+            try:
+                async with ws_connect(self.live_url) as ws:
+                    while not self.live_stop.is_set():
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        # server sends {"od": float, "speed": int}
+                        od = float(data.get("od", "nan"))
+                        speed = data.get("speed", None)
+                        ts = time.time()
+                        try:
+                            self.live_queue.put_nowait((ts, od, speed))
+                        except queue.Full:
+                            pass
+            except Exception:
+                await asyncio.sleep(0.5)
+
+
 DATA = DataStore()
 # ========================= Widgets =========================
 class Gauge(ttk.Frame):
@@ -968,9 +974,9 @@ class Gauge(ttk.Frame):
     def _draw_static(self):
         w, h = self.width, self.height
         cx, cy, r = w//2, h-10, min(w, h*2)//2 - 10
-        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=180, extent=60, fill="#16A34A", outline="")
-        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=240, extent=60, fill="#D97706", outline="")
-        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=300, extent=60, fill="#DC2626", outline="")
+        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=180, extent=-60, fill="#16A34A", outline="")
+        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=120, extent=-60, fill="#D97706", outline="")
+        self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=60, extent=-60, fill="#DC2626", outline="")
         for i in range(0, 11):
             ang = math.radians(180 + i*18)
             x0 = cx + (r-18)*math.cos(ang); y0 = cy + (r-18)*math.sin(ang)
@@ -1046,10 +1052,16 @@ class TrendChart(ttk.Frame):
         # --- CLASS OVERLAYS (stipple ~= alpha) ---
         # --- CLASS OVERLAYS (shaded bands using stipple ~= alpha) ---
         if getattr(DATA, "classes", None):
+            # Store image references to prevent garbage collection
+            if not hasattr(self, '_overlay_images'):
+                self._overlay_images = []
+            self._overlay_images.clear()
+            
             y0 = pad + 1
             y1 = h - pad - 1
             n_total = len(DATA.od)
             offset = n_total - len(y)  # global index represented by local x==0
+            
             for seg in DATA.classes:
                 if seg["label"] not in VISIBLE_CLASSES:
                     continue
@@ -1061,9 +1073,31 @@ class TrendChart(ttk.Frame):
                 i0 = max(0, min(i0, len(y) - 2))     # allow room for at least 1 sample
                 i1 = max(i0 + 1, min(i1, len(y) - 1))
 
-                x0 = X(i0); x1 = X(i1)
+                x0 = X(i0)
+                x1 = X(i1)
+                
+                # Get color and create semi-transparent overlay
                 color = CLASS_COLORS.get(seg["label"], "#BBBBBB")
-                self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, width=0, stipple="gray25")
+                rgb = self.canvas.winfo_rgb(color)
+                # winfo_rgb returns 16-bit values (0-65535), convert to 8-bit (0-255)
+                r = rgb[0] >> 8
+                g = rgb[1] >> 8
+                b = rgb[2] >> 8
+                alpha = 80  # transparency (0=transparent, 255=opaque)
+                
+                # Create RGBA image with proper dimensions
+                width = int(x1 - x0)
+                height = int(y1 - y0)
+                
+                if width > 0 and height > 0:
+                    image = Image.new('RGBA', (width, height), (r, g, b, alpha))
+                    photo = ImageTk.PhotoImage(image)
+                    self._overlay_images.append(photo)  # Keep reference!
+                    
+                    # Use x0, y0 with anchor='nw' to position at top-left
+                    self.canvas.create_image(x0, y0, image=photo, anchor='nw')
+                
+                # Draw label
                 self.canvas.create_text(x0+4, y0+10, text=seg["label"], anchor="w",
                                         fill="#333333", font=("Segoe UI", 8, "bold"))
 
@@ -1079,138 +1113,6 @@ class TrendChart(ttk.Frame):
                                          fill=col, width=0, stipple="gray25")
             self.canvas.create_text(legend_x+18, legend_y + idx*16, text=name, anchor="w",
                                     fill="#111827", font=("Segoe UI", 8))
-
-class FeatureEngine:
-    def __init__(self, od, window=30, fs=1.0):
-        self.od = np.asarray(od, dtype=float)
-        self.win = max(8, int(window * fs))
-        self.step = self.win // 2  # 50% overlap
-        self.fs = fs
-
-    def _windows(self):
-        x = self.od
-        for i in range(0, len(x)-self.win+1, self.step):
-            yield x[i:i+self.win]
-
-    def feature_table(self):
-        rows = []
-        for w in self._windows():
-            y = w
-            mean = float(np.mean(y))
-            std  = float(np.std(y))
-            p2p  = float(np.max(y) - np.min(y))
-            rel_range = p2p / max(1e-9, mean)
-            mad = float(rolling_mad(y))
-            rel_max = (np.max(y) - mean) / max(1e-9, mean)
-            rel_min = (mean - np.min(y)) / max(1e-9, mean)
-            coef_var = std / max(1e-9, mean)
-            norm_var = (std**2) / max(1e-9, mean**2)
-            ptp_ratio = p2p / max(1e-9, std)
-            rows.append({
-                "mean_abs_diff": mad,
-                "coef_variation": coef_var,
-                "relative_range": rel_range,
-                "normalized_variance": norm_var,
-                "peak_to_peak_ratio": ptp_ratio,
-                "relative_max_deviation": rel_max,
-                "relative_min_deviation": rel_min,
-                "max_abs_diff": p2p,
-            })
-        df = pd.DataFrame(rows).replace([np.inf, -np.inf], np.nan).dropna()
-        return df
-
-    def demo_labels(self, df):
-        thr = df["mean_abs_diff"].median() + df["mean_abs_diff"].std()
-        return (df["mean_abs_diff"] > thr).astype(int)
-
-    def kfold_curve(self, X, y, model, windows=[10,20,30,40,60,90,120]):
-        sizes, accs = [], []
-        for w in windows:
-            self.win = max(8, int(w * self.fs))
-            self.step = self.win // 2
-            df = self.feature_table()
-            if len(df) < 20: continue
-            Xw = df.values
-            yw = self.demo_labels(df) if y is None else y[:len(df)]
-            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-            scores = []
-            for tr, te in skf.split(Xw, yw):
-                Xtr, Xte = Xw[tr], Xw[te]
-                ytr = yw.iloc[tr] if isinstance(yw, pd.Series) else yw[tr]
-                yte = yw.iloc[te] if isinstance(yw, pd.Series) else yw[te]
-                scaler = StandardScaler()
-                Xtr = scaler.fit_transform(Xtr); Xte = scaler.transform(Xte)
-                model.fit(Xtr, ytr)
-                scores.append(model.score(Xte, yte))
-            sizes.append(w); accs.append(np.mean(scores))
-        return np.array(sizes), np.array(accs)
-
-    def fig_sixpack(self):
-        df = self.feature_table()
-        if df.empty:
-            fig = Figure(figsize=(12,6), dpi=100)
-            ax = fig.add_subplot(111)
-            ax.text(0.5,0.5,"Not enough data for analysis.\nLoad a longer CSV.", ha="center", va="center")
-            ax.axis("off")
-            return fig
-
-        y = self.demo_labels(df)
-        fig = Figure(figsize=(12,6), dpi=100)
-        gs = fig.add_gridspec(2,3, wspace=0.35, hspace=0.35)
-
-        clf = RandomForestClassifier(n_estimators=200, random_state=42)
-        sizes, acc_rf = self.kfold_curve(df.values, y, clf)
-        ax1 = fig.add_subplot(gs[0,0])
-        for mult, lab in [(0.98,"Logistic Regression (demo)"), (1.00,"Random Forest"), (0.995,"SVM (demo)")]:
-            ax1.plot(sizes, np.minimum(1.0, acc_rf*mult), marker="o", label=lab)
-        ax1.set_title("Average model accuracy vs. Window size\n5-split K-Folds")
-        ax1.set_xlabel("Window size (sec)"); ax1.set_ylabel("Average accuracy"); ax1.legend()
-
-        scaler = StandardScaler().fit(df.values)
-        Xs = scaler.transform(df.values)
-        clf.fit(Xs, y)
-        importances = clf.feature_importances_
-        order = np.argsort(importances)
-        ax2 = fig.add_subplot(gs[0,1])
-        ax2.barh(np.array(df.columns)[order], importances[order])
-        ax2.set_title("Random Forest feature importance\nWindow size: ~30 sec")
-        ax2.set_xlabel("Feature weight")
-
-        ax3 = fig.add_subplot(gs[0,2])
-        ax3.hist(df.loc[y==0,"mean_abs_diff"], bins=40, alpha=0.6, label="Good")
-        ax3.hist(df.loc[y==1,"mean_abs_diff"], bins=40, alpha=0.6, label="Rejected, chatter")
-        ax3.set_title("Mean Absolute Difference (smoothness indicator)\nWindow size: ~30 sec")
-        ax3.set_xlabel("Mean Absolute Difference"); ax3.set_ylabel("Density"); ax3.legend()
-
-        pca = PCA(n_components=2, random_state=42)
-        Xp = pca.fit_transform(Xs)
-        ax4 = fig.add_subplot(gs[1,0])
-        ax4.scatter(Xp[y==0,0], Xp[y==0,1], s=8, alpha=0.5, label="Good")
-        ax4.scatter(Xp[y==1,0], Xp[y==1,1], s=8, alpha=0.8, label="Bad (Chatter)", color="red")
-        ax4.set_title("Principal component analysis")
-        ax4.set_xlabel(f"PC1: {pca.explained_variance_ratio_[0]*100:0.1f}% variance")
-        ax4.set_ylabel(f"PC2: {pca.explained_variance_ratio_[1]*100:0.1f}% variance")
-        ax4.legend(loc="best")
-
-        ax5 = fig.add_subplot(gs[1,1])
-        comps = pca.components_
-        ax5.axvline(0,color="gray",linewidth=0.8); ax5.axhline(0,color="gray",linewidth=0.8)
-        for i, name in enumerate(df.columns):
-            ax5.arrow(0, 0, comps[0,i], comps[1,i], head_width=0.02, head_length=0.02, fc='k', ec='k', alpha=0.6)
-            ax5.text(comps[0,i]*1.08, comps[1,i]*1.08, name, fontsize=8,
-                     bbox=dict(boxstyle="round,pad=0.2", fc="#FFF9C4", ec="#999"))
-        ax5.set_xlim(-1,1); ax5.set_ylim(-1,1)
-        ax5.set_title("Feature weights on principal components")
-        ax5.set_xlabel("PC1 weights"); ax5.set_ylabel("PC2 weights")
-
-        ax6 = fig.add_subplot(gs[1,2])
-        corr = df.corr().values
-        im = ax6.imshow(corr, vmin=-1, vmax=1, cmap="coolwarm")
-        ax6.set_xticks(range(len(df.columns))); ax6.set_xticklabels(df.columns, rotation=60, ha="right", fontsize=8)
-        ax6.set_yticks(range(len(df.columns))); ax6.set_yticklabels(df.columns, fontsize=8)
-        ax6.set_title("Feature Correlation Matrix")
-        fig.colorbar(im, ax=ax6, fraction=0.046, pad=0.04).set_label("Correlation")
-        return fig
 
 # ========================= Pages =========================
 class BasePage(ttk.Frame):
@@ -1236,11 +1138,15 @@ class DataPage(BasePage):
         for i in range(12): controls.columnconfigure(i, weight=1)
         # DataPage.__init__ controls block
 
-        ttk.Button(controls, text="Load CSV/XLSX…",        command=self.load_csv         ).grid(row=0, column=0, sticky="w", padx=(0,8))
+        ttk.Button(controls, text="Load XLSX…", command=self.load_xlsx).grid(row=0, column=0, sticky="w", padx=(0,8))
         
-        ttk.Button(controls, text="Open in VS Code",       command=lambda: open_in_vscode(os.path.abspath("."))).grid(row=0, column=5, sticky="w", padx=(0,8))
-        ttk.Button(controls, text="Load Secondary…", command=self.load_secondary).grid(row=0, column=8, sticky="w", padx=(0,8))
-        ttk.Button(controls, text="OD ↔ Secondary Correlation", command=self.show_corr).grid(row=0, column=9, sticky="w", padx=(0,8))
+        ttk.Label(controls, text="Compare to:").grid(row=0, column=8, sticky="w", padx=(0,4))
+        self.sheet_var = tk.StringVar(value="Select sheet...")
+        self.sheet_dropdown = ttk.Combobox(controls, textvariable=self.sheet_var, state="disabled", width=25, height=25)
+        self.sheet_dropdown.grid(row=0, column=9, sticky="w", padx=(0,8))
+        self.sheet_dropdown.bind('<<ComboboxSelected>>', self.on_sheet_select)
+        
+        ttk.Button(controls, text="Show Correlation", command=self.show_corr).grid(row=0, column=10, sticky="w", padx=(0,8))
 
 
         self.info = ttk.Label(self, text="No file loaded.", foreground="#6B7280")
@@ -1250,22 +1156,70 @@ class DataPage(BasePage):
         self.columnconfigure(0, weight=1); self.rowconfigure(3, weight=1)
         self.placeholder(table_area, "Recent files & preview table will appear here.")
 
-    def load_csv(self):
+        ttk.Label(controls, text="WebSocket URL:").grid(row=1, column=0, sticky="w", pady=(6,0))
+        self.ws_url = tk.StringVar(value="ws://localhost:6467")
+        ttk.Entry(controls, textvariable=self.ws_url, width=40).grid(row=1, column=1, sticky="w", pady=(6,0), padx=(0,8))
+
+        ttk.Button(controls, text="Connect Live", command=self.connect_live).grid(row=1, column=2, sticky="w", pady=(6,0), padx=(0,8))
+        ttk.Button(controls, text="Disconnect",  command=self.disconnect_live).grid(row=1, column=3, sticky="w", pady=(6,0))
+        # Optional decimation toggle (default: on)
+        self.decimate_var = tk.BooleanVar(value=True)
+        def _on_decimate_toggle(*_):
+            # update global setting and clear any partial bucket
+            DATA.decimate_enabled = self.decimate_var.get()
+            DATA._decim_current_sec = None
+            DATA._decim_vals = []
+            DATA._decim_speed_ok = False
+            App.status(f"Decimation to 1 Hz {'enabled' if DATA.decimate_enabled else 'disabled'}")
+        self.decimate_var.trace_add('write', _on_decimate_toggle)
+        ttk.Checkbutton(controls, text="Decimate live data to 1 Hz (median)", variable=self.decimate_var).grid(row=1, column=4, sticky="w", pady=(6,0), padx=(8,0))
+
+
+        self.after(200, self._poll_live_queue)
+
+    def load_xlsx(self):
         path = filedialog.askopenfilename(
-            title="Select data file (CSV/XLSX/XLS)",
-            filetypes=[("Data files", "*.csv *.xlsx *.xls"),
-                       ("CSV files", "*.csv"),
-                       ("Excel files", "*.xlsx *.xls"),
-                       ("All files","*.*")]
+            title="Select XLSX file",
+            filetypes=[("Excel files", "*.xlsx *.xls")]
         )
         if not path: return
         try:
-            DATA.load_data(path)
+            app_instance = self.winfo_toplevel()
+            DATA.load_data(path, app=app_instance)
             self.info.config(text=f"Loaded: {os.path.basename(path)}  •  rows={len(DATA.od)}")
+            
+            excluded = ['NDC_System_OD_Value', 'YS_Pullout1_Act_Speed_fpm']
+            available = [s for s in DATA.available_sheets if s not in excluded]
+            
+            if available:
+                self.sheet_dropdown['values'] = available
+                self.sheet_dropdown['state'] = 'readonly'
+                self.sheet_var.set("Select sheet...")
+            else:
+                self.sheet_dropdown['values'] = []
+                self.sheet_dropdown['state'] = 'disabled'
+                self.sheet_var.set("No other sheets")
+
+            app_instance = self.winfo_toplevel()
+            if hasattr(app_instance, 'pages') and 'Model' in app_instance.pages:
+                app_instance.pages['Model'].reset_confidence_plot()
+            
             App.status("Data loaded. History & gauge now using real data.")
         except Exception as e:
             messagebox.showerror("Load Data failed", str(e))
             App.status("Data load failed")
+
+    def on_sheet_select(self, event):
+        selected_sheet = self.sheet_var.get()
+        if selected_sheet and selected_sheet not in ["Select sheet...", "No other sheets"]:
+            try:
+                DATA.load_secondary_sheet(selected_sheet)
+                self.info.config(text=f"{self.info.cget('text')}  •  comparing to '{selected_sheet}' (paired={len(DATA.paired_df)})")
+                App.status(f"Secondary sheet loaded: {selected_sheet}")
+            except Exception as e:
+                messagebox.showerror("Load Secondary failed", str(e))
+                App.status("Load secondary failed")
+                self.sheet_var.set("Select sheet...")
 
     def load_classes(self):
         if not DATA.od:
@@ -1287,29 +1241,9 @@ class DataPage(BasePage):
             messagebox.showerror("Load Classes failed", str(e))
             App.status("Classes load failed")
 
-    def load_secondary(self):
-        if not DATA.od:
-            messagebox.showwarning("Load OD first", "Please load the OD CSV/XLSX first.")
-            return
-        path = filedialog.askopenfilename(
-            title="Select secondary file (CSV/XLSX/XLS)",
-            filetypes=[("Data files", "*.csv *.xlsx *.xls"),
-                       ("CSV files", "*.csv"),
-                       ("Excel files", "*.xlsx *.xls"),
-                       ("All files","*.*")]
-        )
-        if not path: return
-        try:
-            DATA.load_secondary(path)
-            self.info.config(text=f"{self.info.cget('text')}  •  secondary='{os.path.basename(path)}' (paired={len(DATA.paired_df)})")
-            App.status("Secondary series loaded and aligned.")
-        except Exception as e:
-            messagebox.showerror("Load Secondary failed", str(e))
-            App.status("Load secondary failed")
-
     def show_corr(self):
         if DATA.paired_df is None or DATA.paired_df.empty:
-            messagebox.showinfo("Correlation", "Load a secondary file first (and ensure it aligned).")
+            messagebox.showinfo("Correlation", "Select a secondary sheet first from the dropdown.")
             return
         CorrelationWindow(self)
 
@@ -1346,141 +1280,382 @@ class DataPage(BasePage):
         except Exception as e:
             messagebox.showerror("Load from Features failed", str(e)); App.status("Load from features failed")
 
+    def connect_live(self):
+        try:
+            DATA.start_live(self.ws_url.get().strip())
+            self.info.config(text=f"Live: connected to {self.ws_url.get().strip()}")
+            App.status("Live feed connected")
+        except Exception as e:
+            messagebox.showerror("Live Connect failed", str(e))
+            App.status("Live connect failed")
 
-class LiveTimeSeries(ttk.Frame):
+    def disconnect_live(self):
+        DATA.stop_live()
+        self.info.config(text=f"{self.info.cget('text')}  •  live stopped")
+        App.status("Live feed disconnected")
+
+    def _poll_live_queue(self):
+        # Drain queue and append samples; decimation optional via checkbox; keep UI snappy
+        got = DATA._consume_live_queue()
+        # If a model is selected, you can auto-update classes here, e.g. re-run on latest slice.
+        # For efficiency, do this on a cadence or on a fixed “latest N” buffer, not every single tick.
+        if got and DATA.model is not None and DATA.window_size and len(DATA.od) >= DATA.window_size:
+            # Option A: run every second (simple debounce)
+            now = time.time()
+            if not hasattr(self, "_last_cls_ts") or now - self._last_cls_ts >= 1.0:
+                DATA.auto_classify(DATA.window_size)
+                self._last_cls_ts = now
+                app_instance = self.winfo_toplevel()
+                if hasattr(app_instance, 'pages') and 'Analysis' in app_instance.pages:
+                    analysis_page = app_instance.pages['Analysis']
+                    analysis_page.update_confidence_timeline()
+
+        self.after(100, self._poll_live_queue)
+
+class ModelPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
+        self.headline("Select a model and window size")
+        
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=2)
+        self.rowconfigure(1, weight=1)
+        
+        left_frame = ttk.Frame(self)
+        left_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        
+        ttk.Label(left_frame, text="Select Model:", style="Subhead.TLabel").pack(anchor="w", pady=(0, 8))
+        
+        self.models = {}
+        self.load_models()
 
+        self.cb = ttk.Combobox(left_frame, values=sorted(list(self.models.keys())), height=30, width=40)
+        self.cb.set("Pick a model")
+        self.cb.pack(pady=(0, 16))
+        self.cb.bind('<<ComboboxSelected>>', self.on_model_select)
+        
+        ttk.Button(left_frame, text="Update Likelihood Plot", command=self.update_confidence_plot).pack(pady=(8, 0))
+        
+        right_frame = ttk.Frame(self)
+        right_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+        
+        ttk.Label(right_frame, text="Average likelihood of chatter being detected in entire dataset (all windows)\n         by each model over different window sizes\nHigher likelihood = chatter likely present\nLower likelihood = chatter unlikely\nMiddle likelihood near decision boundary = unsure prediction", 
+                 style="Subhead.TLabel").pack(anchor="w", pady=(0, 8))
+        
+        self.fig_conf = Figure(figsize=(8, 5), dpi=100)
+        self.ax_conf = self.fig_conf.add_subplot(111)
+        self.canvas_conf = FigureCanvasTkAgg(self.fig_conf, master=right_frame)
+        self.canvas_conf.get_tk_widget().pack(fill="both", expand=True)
+        
+        self.ax_conf.text(0.5, 0.5, "Load data and click 'Update Likelihood Plot'\nto see model predictions", 
+                         ha="center", va="center", fontsize=12)
+        self.ax_conf.axis("off")
+        self.fig_conf.tight_layout()
+        self.canvas_conf.draw()
+
+    def on_model_select(self, event):
+        DATA.model = self.models[self.cb.get()]
+        DATA.window_size = int(self.cb.get().split('Window Size ')[1].rstrip(')'))
+        if DATA.od:
+            DATA.auto_classify(DATA.window_size)
+            app_instance = self.winfo_toplevel()
+            # if hasattr(app_instance, 'pages') and 'Results' in app_instance.pages:
+            #     results_page = app_instance.pages['Results']
+            #     results_page._tick()
+            if hasattr(app_instance, 'pages') and 'Analysis' in app_instance.pages:
+                analysis_page = app_instance.pages['Analysis']
+                analysis_page.update_confidence_timeline()
+            
+            App.status(f"Model changed and classifications updated")
+
+    def update_confidence_plot(self):
+        if not DATA.od:
+            messagebox.showinfo("No Data", "Please load data first")
+            return
+        
+        App.status("Computing confidence curves... this may take a moment")
+        
+        # Group models by type and window size
+        model_types = {}  # {model_type: {window_size: model}}
+        for model_name, model in self.models.items():
+            # Parse model name: "Model Type (Window Size XX)"
+            parts = model_name.rsplit(' (Window Size ', 1)
+            if len(parts) == 2:
+                model_type = parts[0]
+                window_size = int(parts[1].rstrip(')'))
+                
+                if model_type not in model_types:
+                    model_types[model_type] = {}
+                model_types[model_type][window_size] = model
+        
+        # Compute average confidence for each model type at each window size
+        results = {}  # {model_type: ([window_sizes], [avg_confidences])}
+        
+        for model_type, ws_dict in model_types.items():
+            window_sizes = []
+            avg_confidences = []
+            
+            for ws in sorted(ws_dict.keys()):
+                model = ws_dict[ws]
+                
+                num_windows = len(DATA.od) // ws
+                if num_windows < 1:
+                    continue
+                
+                features_list = []
+                for i in range(num_windows):
+                    start_idx = i * ws
+                    end_idx = start_idx + ws
+                    if end_idx > len(DATA.od):
+                        break
+                    window = DATA.od[start_idx:end_idx]
+                    features_dict = DATA.extract_features(window)
+                    features_list.append(features_dict)
+                
+                if not features_list:
+                    continue
+                
+                X = pd.DataFrame(features_list)
+                probas = model.predict_proba(X)
+                
+                avg_conf = np.mean(probas[:, 1]) * 100 
+                
+                window_sizes.append(ws)
+                avg_confidences.append(avg_conf)
+            
+            if window_sizes:
+                results[model_type] = (window_sizes, avg_confidences)
+        
+        self.ax_conf.clear()
+        
+        colors = ['#2563EB', '#DC2626', '#16A34A', '#F59E0B']
+        markers = ['o', 's', '^', 'd']
+        
+        for idx, (model_type, (ws, confs)) in enumerate(sorted(results.items())):
+            color = colors[idx % len(colors)]
+            marker = markers[idx % len(markers)]
+            self.ax_conf.plot(ws, confs, marker=marker, linewidth=2, markersize=6,
+                            label=model_type, color=color)
+        
+        self.ax_conf.set_xlabel('Window Size (samples)', fontsize=11)
+        self.ax_conf.set_ylabel('Chatter Likelihood (%)', fontsize=11)
+        self.ax_conf.set_title('Average Chatter Likelihood vs Window Size', 
+                              fontsize=12, fontweight='bold')
+        self.ax_conf.legend(loc='best', fontsize=9)
+        self.ax_conf.grid(True, alpha=0.3)
+        self.ax_conf.set_ylim([0, 105])
+        
+        self.ax_conf.axhline(y=50, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        self.ax_conf.text(self.ax_conf.get_xlim()[1], 50, ' Decision boundary', 
+                         va='center', fontsize=9, color='gray')
+        
+        self.fig_conf.tight_layout()
+        self.canvas_conf.draw()
+        
+        App.status(f"Confidence plot updated with {len(results)} model types")
+
+    def load_models(self):
+        all_model_files = os.listdir("models")
+        for model_file in all_model_files:
+            if not model_file.endswith('.pkl') or model_file.startswith('scaler_'):
+                continue
+                
+            model_path = os.path.join("models", model_file)
+            with open(model_path, 'rb') as f:
+                model = pickle.load(f)
+                name_parts = model_file.split("_")
+                match name_parts[1]:
+                    case 'logit':
+                        model_name = f"Logistic Regression (Window Size {name_parts[2][2:-4]})"
+                        self.models[model_name] = model
+                    case 'rf':
+                        model_name = f"Random Forest (Window Size {name_parts[2][2:-4]})"
+                        self.models[model_name] = model
+                    case 'svm':
+                        model_name = f"SVM (Window Size {name_parts[2][2:-4]})"
+                        self.models[model_name] = model
+                    case 'xgboost':
+                        model_name = f"XGBoost (Window Size {name_parts[2][2:-4]})"
+                        self.models[model_name] = model
+                    case _:
+                        self.models[model_file] = model
+
+    def reset_confidence_plot(self):
+        self.ax_conf.clear()
+        self.ax_conf.text(0.5, 0.5, "Load data and click 'Update Likelihood Plot'\nto see model predictions", 
+                         ha="center", va="center", fontsize=12, color='#6B7280')
+        self.ax_conf.axis("off")
+        self.fig_conf.tight_layout()
+        self.canvas_conf.draw()
+        App.status("Confidence plot reset")
+
+class LiveTimeSeries(ttk.Frame):
+    """Matplotlib live plot with class shading via axvspan."""
+    def __init__(self, parent):
+        super().__init__(parent)
         self.fig = Figure(figsize=(6,3), dpi=100)
-        self.ax  = self.fig.add_subplot(111)
+        self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        # Matplotlib toolbar (gives you Box Zoom + Pan buttons)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, self)
+        tbar = ttk.Frame(self); tbar.pack(fill="x")
+        self.toolbar = NavigationToolbar2Tk(self.canvas, tbar)
+
+        self._user_view_active = False
+        self._saved_xlim = None
+        self._saved_ylim = None
+
+        def _on_mouse(event):
+            try:
+                mode = getattr(self.toolbar, "mode", "")
+            except Exception:
+                mode = ""
+            if event.inaxes is self.ax and mode in ("zoom rect", "pan/zoom"):
+                self._user_view_active = True
+                self._saved_xlim = self.ax.get_xlim()
+                self._saved_ylim = self.ax.get_ylim()
+
+        self.canvas.mpl_connect("button_release_event", _on_mouse)
+        self.canvas.mpl_connect("scroll_event", lambda e: (
+            setattr(self, "_user_view_active", True),
+            setattr(self, "_saved_xlim", self.ax.get_xlim()),
+            setattr(self, "_saved_ylim", self.ax.get_ylim())
+        ))
+
+        def _home_wrapper(*args, **kwargs):
+            self.reset_view()
+            NavigationToolbar2Tk.home(self.toolbar)
+
+        try:
+            btn = (getattr(self.toolbar, "_buttons", {}).get("home")
+                or getattr(self.toolbar, "_buttons", {}).get("Home"))
+            if btn is not None:
+                btn.configure(command=_home_wrapper)
+        except Exception:
+            pass
+
+        self._last_len = -1
         self.toolbar.update()
+        self.after(1000, self._tick)
+        
 
-        self._last_len   = -1
-        self.view_start  = 0        # inclusive
-        self.view_end    = None     # exclusive; None => full length
-        self._pan_anchor = None     # xdata at mouse-down for panning
+    def reset_view(self):
+        """Return to autoscaling and clear any saved manual limits."""
+        self._user_view_active = False
+        self._saved_xlim = None
+        self._saved_ylim = None
+        try:
+            self.ax.relim()
+            self.ax.autoscale_view()
+        except Exception:
+            pass
+        self.canvas.draw_idle()
+        # If you have a toolbar present:
+        try:
+            self.toolbar.update()
+        except Exception:
+            pass
 
-        # mouse interactions
-        self.canvas.mpl_connect('scroll_event', self._on_scroll)
-        self.canvas.mpl_connect('button_press_event', self._on_press)
-        self.canvas.mpl_connect('motion_notify_event', self._on_motion)
-        self.canvas.mpl_connect('button_release_event', self._on_release)
-
-        self.after(250, self._tick)
-
-    # --------- interactions ----------
-    def _clamp_view(self, i0, i1):
-        n = len(DATA.od)
-        if n == 0: return 0, 0
-        width = max(100, i1 - i0)            # never smaller than 100 samples
-        i0 = int(max(0, min(i0, n - width)))
-        i1 = int(min(n, i0 + width))
-        return i0, i1
-
-    def _on_scroll(self, e):
-        if not DATA.od or e.xdata is None: return
-        i0, i1 = self._current_view()
-        center = int(np.clip(e.xdata, i0, max(i0+1, i1-1)))
-        scale  = 1/1.2 if e.button == 'up' else 1.2
-        new_w  = int((i1 - i0) * scale)
-        i0 = center - new_w//2
-        i1 = center + new_w//2
-        self.view_start, self.view_end = self._clamp_view(i0, i1)
-        self._draw()
-
-    def _on_press(self, e):
-        if not DATA.od or e.inaxes != self.ax: return
-        if e.button == 1:  # left-drag to pan
-            self._pan_anchor = e.xdata
-
-    def _on_motion(self, e):
-        if self._pan_anchor is None or e.xdata is None: return
-        i0, i1 = self._current_view()
-        shift  = int(self._pan_anchor - e.xdata)
-        self.view_start, self.view_end = self._clamp_view(i0 + shift, i1 + shift)
-        self._pan_anchor = e.xdata
-        self._draw()
-
-    def _on_release(self, e):
-        self._pan_anchor = None
-
-    def _current_view(self):
-        n = len(DATA.od)
-        if n == 0: return 0, 0
-        i0 = self.view_start
-        i1 = n if self.view_end is None else self.view_end
-        return self._clamp_view(i0, i1)
-
-    # --------- drawing ----------
     def _draw(self):
+        if self._user_view_active:
+            xlim = self._saved_xlim or self.ax.get_xlim()
+            ylim = self._saved_ylim or self.ax.get_ylim()
+        else:
+            xlim = ylim = None
         self.ax.clear()
         if not DATA.od:
-            self.ax.text(0.5, 0.5, "(Load CSV to see live plot)", ha="center", va="center")
+            self.ax.text(0.5,0.5,"(Load CSV to see live plot)", ha="center", va="center")
             self.ax.axis("off")
             self.canvas.draw(); return
 
-        n  = len(DATA.od)
-        i0, i1 = self._current_view()
+        y = np.asarray(DATA.od[-24000:])  # last ~2400 samples
+        x = np.arange(len(y))
+        self.ax.plot(x, y, linewidth=1.0, alpha=0.7, label="OD")
 
-        x_all = np.arange(n)
-        y_all = np.asarray(DATA.od, dtype=float)
-        x = x_all[i0:i1]; y = y_all[i0:i1]
-
-        self.ax.plot(x, y, linewidth=1.0, alpha=0.7, label="OD", zorder=1)
-
-        # smooth overlay
+        # simple smoothing
         k = max(5, len(y)//50)
         if len(y) >= k:
             sm = pd.Series(y).rolling(k, min_periods=1).mean().values
-            self.ax.plot(x, sm, linewidth=2.0, label="smooth", zorder=2)
+            self.ax.plot(x, sm, linewidth=2.0, label="smooth")
 
-        # class shading in window coordinates
+        # class shading (convert global i0/i1 to local indices)
         if getattr(DATA, "classes", None):
+            n_total = len(DATA.od)
+            offset = n_total - len(y)
             for seg in DATA.classes:
-                if seg["label"] not in VISIBLE_CLASSES: continue
-                j0 = max(i0, seg["i0"]); j1 = min(i1, seg["i1"])
-                if j1 <= j0: continue
-                c = CLASS_COLORS.get(seg["label"], "#BBBBBB")
-                self.ax.axvspan(j0, j1, facecolor=c, alpha=0.25, linewidth=0, zorder=0)
+                if seg["label"] not in VISIBLE_CLASSES:
+                    continue
+                i0 = seg["i0"] - offset
+                i1 = seg["i1"] - offset
+                if i1 <= 0 or i0 >= len(y):
+                    continue
+                # clamp so we always draw something
+                i0 = max(0, min(i0, len(y) - 2))
+                i1 = max(i0 + 1, min(i1, len(y) - 1))
 
-        self.ax.set_title("OD — zoom & pan")
-        self.ax.set_xlabel("sample index"); self.ax.set_ylabel("OD (mm)")
-        self.ax.set_xlim(i0, i1-1)
-        self.ax.legend(loc="upper left", fontsize=8)
+                c = CLASS_COLORS.get(seg["label"], "#BBBBBB")
+                self.ax.axvspan(i0, i1, facecolor=c, alpha=0.25, linewidth=0)
+                
+                # Add label text on the overlay
+                self.ax.text(i0 + 2, self.ax.get_ylim()[1] * 0.95, seg["label"], 
+                           fontsize=8, color='#333333', weight='bold')
+
+        self.ax.set_title("OD vs Samples — live")
+        self.ax.set_xlabel("sample index")
+        self.ax.set_ylabel("OD (inches)")
+        
+        # Create legend with both line plots AND class overlays
+        handles, labels = self.ax.get_legend_handles_labels()
+        
+        # Add class colors to legend
+        if getattr(DATA, "classes", None):
+            from matplotlib.patches import Patch
+            for name, color in CLASS_COLORS.items():
+                if name in VISIBLE_CLASSES:
+                    handles.append(Patch(facecolor=color, alpha=0.25, label=name))
+                    labels.append(name)
+
+        if self._user_view_active and xlim and ylim:
+            # Preserve user’s zoom/pan
+            try:
+                self.ax.set_xlim(xlim)
+                self.ax.set_ylim(ylim)
+            except Exception:
+                # If limits invalid due to data shrinking, fall back to autoscale
+                self._user_view_active = False
+                self._saved_xlim = self._saved_ylim = None
+                self.ax.relim(); self.ax.autoscale_view()
+        else:
+            # No manual interaction: autoscale to new data
+            self.ax.relim()
+            self.ax.autoscale_view()
+        
+        self.ax.legend(handles, labels, loc="upper left", fontsize=8)
         self.fig.tight_layout()
         self.canvas.draw()
+        self.toolbar.update()
 
     def _tick(self):
-        # refresh if new data arrived (or on first draw)
-        if len(DATA.od) != self._last_len:
-            # keep right edge anchored when new samples come in
-            if self.view_end is None:
-                # already “fit all”; nothing to do
-                pass
-            else:
-                grow = len(DATA.od) - self._last_len
-                if grow > 0:  # push window to the right with new data
-                    self.view_start += grow
-                    self.view_end   += grow
+        current_len = len(DATA.od)
+        current_classes = len(DATA.classes) if hasattr(DATA, 'classes') else 0
+        
+        if (current_len != self._last_len or 
+            current_classes != getattr(self, '_last_classes_len', -1)):
             self._draw()
-            self._last_len = len(DATA.od)
-        self.after(500, self._tick)
-
+            self.toolbar.update()
+            self._last_len = current_len
+            self._last_classes_len = current_classes
+        
+        self.after(1000, self._tick)
 
 class ResultsPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
-        self.headline("Results (Blueprint)")
+        self.headline("Results")
 
         tools = ttk.Frame(self); tools.grid(row=1, column=0, sticky="ew", pady=(0,12))
-        ttk.Button(tools, text="Predict Latest", command=self.predict_latest).grid(row=0, column=0, sticky="w", padx=(0,8))
-        ttk.Button(tools, text="Export Report", command=lambda: App.busy("Export report (todo)")).grid(row=0, column=1, sticky="w", padx=(0,8))
-        ttk.Button(tools, text="Open in VS Code", command=lambda: open_in_vscode(os.path.abspath("."))).grid(row=0, column=2, sticky="w")
+        # ttk.Button(tools, text="Predict Latest", command=self.predict_latest).grid(row=0, column=0, sticky="w", padx=(0,8))
+        # ttk.Button(tools, text="Export Report", command=lambda: App.busy("Export report (todo)")).grid(row=0, column=1, sticky="w", padx=(0,8))
 
         grid = ttk.Frame(self); grid.grid(row=2, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1); self.rowconfigure(2, weight=1)
@@ -1498,105 +1673,149 @@ class ResultsPage(BasePage):
         ttk.Label(right_top, text="OK / NG Indicator", style="Subhead.TLabel").pack(anchor="w")
         self.gauge = Gauge(right_top, width=360, height=200); self.gauge.pack(fill="both", expand=True, pady=(6,0))
 
-        right_bot = ttk.Frame(grid); right_bot.grid(row=1, column=1, sticky="nsew", padx=(8,0))
-        ttk.Label(right_bot, text="Model Metrics", style="Subhead.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6))
-        right_bot.columnconfigure((0,1,2,3), weight=1); right_bot.rowconfigure(1, weight=1)
-
-        mat = ttk.Frame(right_bot, padding=6, relief="ridge"); mat.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=(0,6))
-        for i in range(3): mat.columnconfigure(i, weight=1)
-        for i in range(3): mat.rowconfigure(i, weight=1)
-        ttk.Label(mat, text="Predicted", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, columnspan=2)
-        ttk.Label(mat, text="Actual", font=("Segoe UI", 9, "bold")).grid(row=1, column=0, rowspan=2, sticky="s")
-        ttk.Label(mat, text="OK").grid(row=1, column=1);   ttk.Label(mat, text="NG").grid(row=1, column=2)
-        ttk.Label(mat, text="OK").grid(row=2, column=0, sticky="e")
-        self.cm_tn = ttk.Label(mat, text="—", style="KPI.TLabel"); self.cm_tn.grid(row=2, column=1)
-        self.cm_fp = ttk.Label(mat, text="—", style="KPI.TLabel"); self.cm_fp.grid(row=2, column=2)
-        ttk.Label(mat, text="NG").grid(row=3, column=0, sticky="e")
-        self.cm_fn = ttk.Label(mat, text="—", style="KPI.TLabel"); self.cm_fn.grid(row=3, column=1)
-        self.cm_tp = ttk.Label(mat, text="—", style="KPI.TLabel"); self.cm_tp.grid(row=3, column=2)
-
-        kpis = ttk.Frame(right_bot); kpis.grid(row=1, column=2, columnspan=2, sticky="nsew")
-        for i in range(2): kpis.columnconfigure(i, weight=1)
-        self.k_acc = ttk.Label(kpis, text="Accuracy: —", style="KPI.TLabel"); self.k_acc.grid(row=0, column=0, sticky="w", pady=(0,6))
-        self.k_prec= ttk.Label(kpis, text="Precision: —", style="KPI.TLabel"); self.k_prec.grid(row=1, column=0, sticky="w", pady=(0,6))
-        self.k_rec = ttk.Label(kpis, text="Recall: —",    style="KPI.TLabel"); self.k_rec.grid(row=0, column=1, sticky="w", pady=(0,6))
-        self.k_f1  = ttk.Label(kpis, text="F1 Score: —",  style="KPI.TLabel"); self.k_f1.grid(row=1, column=1, sticky="w", pady=(0,6))
-
         self.pred_label = ttk.Label(right_top, text="Predicted class: —", style="KPI.TLabel")
         self.pred_label.pack(anchor="w", pady=(6, 0))
         self.pred_conf  = ttk.Label(right_top, text="Confidence: —", style="KPI.TLabel")
         self.pred_conf.pack(anchor="w")
 
+        # NEW: FFT metric label just under Confidence
+        self.fft_metric = ttk.Label(
+            right_top,
+            text="FFT: —",
+            style="KPI.TLabel"
+        )
+        self.fft_metric.pack(anchor="w", pady=(2, 0))
+
         self.after(1000, self._tick)
 
-    def predict_latest(self):
-        lbl, risk = DATA.current_class()
-        if lbl is None:
-            risk = DATA.ng_score(n=1024, spec_mm=10.0, spec_band=0.02) / 100.0
-            if   risk < 0.25: lbl = "STEADY"
-            elif risk < 0.45: lbl = "MILD_WAVE"
-            elif risk < 0.65: lbl = "DRIFT"
-            elif risk < 0.80: lbl = "BURSTY_NOISY"
-            else:             lbl = "STRONG_WAVE"
-
-        self.pred_label.config(text=f"Predicted class: {lbl}")
-        self.pred_conf.config(text=f"Confidence: {risk*100:0.1f}%")
-    # (demo confusion/kpis stays the same)
-
-
-        # If no class window overlaps the latest point, derive a risk from NG score.
-        if lbl is None:
-            risk = DATA.ng_score(n=1024, spec_mm=10.0, spec_band=0.02) / 100.0
-            # map continuous risk to a label-ish category
-            if   risk < 0.25: lbl = "STEADY"
-            elif risk < 0.45: lbl = "MILD_WAVE"
-            elif risk < 0.65: lbl = "DRIFT"
-            elif risk < 0.80: lbl = "BURSTY_NOISY"
-            else:             lbl = "STRONG_WAVE"
-
-        # Show to the user
-        self.pred_label.config(text=f"Predicted class: {lbl}")
-        self.pred_conf.config(text=f"Confidence: {risk*100:0.1f}%")
-
-        # Demo confusion-block numbers (keep your existing block if you want)
-        tp = int(100 * risk * 0.6); tn = int(100 * (1.0 - risk) * 0.6)
-        fp = int(100 * (1.0 - risk) * 0.4); fn = int(100 * risk * 0.4)
-        acc = (tp + tn) / max(1, (tp+tn+fp+fn))
-        prec = tp / max(1, (tp+fp)); rec = tp / max(1, (tp+fn))
-        f1 = 2*prec*rec / max(1e-9, (prec+rec))
-        self.cm_tp.config(text=str(tp)); self.cm_tn.config(text=str(tn))
-        self.cm_fp.config(text=str(fp)); self.cm_fn.config(text=str(fn))
-        self.k_acc.config(text=f"Accuracy: {acc*100:0.1f}%")
-        self.k_prec.config(text=f"Precision: {prec*100:0.1f}%")
-        self.k_rec.config(text=f"Recall: {rec*100:0.1f}%")
-        self.k_f1.config(text=f"F1 Score: {f1*100:0.1f}%")
-        App.status("Prediction updated from waviness class / risk.")
-
-
     def _tick(self):
-        if DATA.od:
+        pct = 50
+
+        if DATA.od and DATA.classes:
             lbl, class_risk = DATA.current_class()
             if class_risk is not None:
                 pct = class_risk * 100.0
                 self.pred_label.config(text=f"Predicted class: {lbl}")
                 self.pred_conf.config(text=f"Confidence: {pct:0.1f}%")
             else:
-                pct = DATA.ng_score(n=1024, spec_mm=10.0, spec_band=0.02)
-        else:
+                pct = 0
+                self.pred_label.config(text="Error")
+                self.pred_conf.config(text=f"Error")
+        elif DATA.od:
+            # data loaded but no model selected yet
             pct = 50 + 15 * math.sin(datetime.now().timestamp()/2.0)
+            self.pred_label.config(text="Predicted class: —")
+            self.pred_conf.config(text="Please select a model")
+        else:
+            # no data - demo mode
+            pct = 50 + 15 * math.sin(datetime.now().timestamp()/2.0)
+            self.pred_label.config(text="Predicted class: —")
+            self.pred_conf.config(text="Please import data and select a model")
 
         self.gauge.set_value(pct)
+
+        # --- NEW: FFT-based “periodicity strength” metric ---
+        fft_info = self._compute_fft_metric(n=24000)
+
+        if fft_info is None:
+            # No usable FFT
+            self.fft_metric.config(
+                text="FFT: inconclusive (not enough data or flat signal)"
+            )
+        # elif not fft_info["periodic"]:
+        #     # FFT computed but no strong dominant peak
+        #     self.fft_metric.config(
+        #         text="FFT: inconclusive (no dominant periodic component)"
+        #     )
+        else:
+            # Clear harmonic found
+            self.fft_metric.config(
+                text=(
+                    f"FFT: peak power {fft_info['peak_power']:.3g} "
+                    f"at {fft_info['peak_freq']:.3g} Hz "
+                    f"(prominence {fft_info['prominence']*100:.1f}%)"
+                )
+            )
+
         self.after(1000, self._tick)
 
+    def _compute_fft_metric(self, n=512):
+        """
+        Look at the most recent n OD samples and compute:
+          - peak frequency (Hz)
+          - peak power (arbitrary units)
+          - prominence = peak_power / total_power in non-DC bins
+        Returns None if there isn't enough data or signal is degenerate.
+        """
+        if not DATA.od:
+            return None
+
+        y = np.asarray(DATA.recent_window(n), dtype=float)
+        if y.size < 16:
+            # too short for a meaningful FFT
+            return None
+
+        # Detrend by removing mean
+        y = y - np.mean(y)
+        if not np.any(np.isfinite(y)) or np.allclose(y, 0.0, atol=1e-12):
+            return None
+
+        # Estimate sampling period from timestamps (fallback to 1 Hz)
+        fs = 1.0
+        try:
+            if DATA.ts_dt and len(DATA.ts_dt) >= len(y):
+                t = pd.to_datetime(DATA.ts_dt[-len(y):], errors="coerce")
+                t = t[~pd.isna(t)]
+                if len(t) >= 2:
+                    dt_sec = np.median(
+                        np.diff(t).astype("timedelta64[ns]").astype(np.float64)
+                    ) / 1e9
+                    if dt_sec > 0:
+                        fs = 1.0 / dt_sec
+        except Exception:
+            pass
+
+        nfft = len(y)
+        freqs = np.fft.rfftfreq(nfft, d=1.0/fs)
+        fft_vals = np.fft.rfft(y)
+        psd = (np.abs(fft_vals)**2) / nfft
+
+        if psd.size <= 1:
+            return None
+
+        # Ignore DC component at index 0
+        psd_no_dc = psd[1:]
+        freqs_no_dc = freqs[1:]
+
+        peak_idx = int(np.argmax(psd_no_dc))
+        peak_freq = float(freqs_no_dc[peak_idx])
+        peak_power = float(psd_no_dc[peak_idx])
+        total_power = float(np.sum(psd_no_dc))
+
+        if not np.isfinite(peak_power) or total_power <= 0 or not np.isfinite(total_power):
+            return None
+
+        prominence = float(peak_power / total_power)
+
+        # Heuristic: require a reasonably dominant peak
+        periodic = prominence > 0.1
+
+        return {
+            "fs": fs,
+            "peak_freq": peak_freq,
+            "peak_power": peak_power,
+            "prominence": prominence,
+            "periodic": periodic,
+        }
 
 
 class HistoryPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
         self.headline("Historical Trend")
-        desc = "Trend view shows last N samples with smoothed curve and class overlays.\n" \
-               "Use this to see if the process is drifting toward NG before defects happen."
-        ttk.Label(self, text=desc, foreground="#6B7280").grid(row=1, column=0, sticky="w", pady=(0,8))
+        # desc = "Trend view shows last N samples with smoothed curve and class overlays.\n" \
+        #        "Use this to see if the process is drifting toward NG before defects happen."
+        ttk.Label(self, foreground="#6B7280").grid(row=1, column=0, sticky="w", pady=(0,8))
 
         grid = ttk.Frame(self); grid.grid(row=2, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1); self.rowconfigure(2, weight=1)
@@ -1607,10 +1826,10 @@ class HistoryPage(BasePage):
 
         side = ttk.Frame(grid); side.grid(row=0, column=1, sticky="nsew", padx=(8,0))
         side.columnconfigure(0, weight=1)
-        ttk.Label(side, text="Latest Stats", style="Subhead.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6))
-        self.l_slope = ttk.Label(side, text="Slope: —", style="KPI.TLabel"); self.l_slope.grid(row=1, column=0, sticky="w", pady=4)
-        self.l_p2p   = ttk.Label(side, text="Peak-to-peak: —", style="KPI.TLabel"); self.l_p2p.grid(row=2, column=0, sticky="w", pady=4)
-        self.l_score = ttk.Label(side, text="Risk score: —", style="KPI.TLabel"); self.l_score.grid(row=3, column=0, sticky="w", pady=4)
+        # ttk.Label(side, text="Latest Stats", style="Subhead.TLabel").grid(row=0, column=0, sticky="w", pady=(0,6))
+        # self.l_slope = ttk.Label(side, text="Slope: —", style="KPI.TLabel"); self.l_slope.grid(row=1, column=0, sticky="w", pady=4)
+        # self.l_p2p   = ttk.Label(side, text="Peak-to-peak: —", style="KPI.TLabel"); self.l_p2p.grid(row=2, column=0, sticky="w", pady=4)
+        # self.l_score = ttk.Label(side, text="Risk score: —", style="KPI.TLabel"); self.l_score.grid(row=3, column=0, sticky="w", pady=4)
 
         self.after(1000, self._tick)
 
@@ -1618,9 +1837,9 @@ class HistoryPage(BasePage):
         slope = DATA.trend_slope(1024)
         p2p   = DATA.volatility_p2p(1024)
         score = DATA.ng_score(1024, spec_mm=10.0, spec_band=0.02)
-        self.l_slope.config(text=f"Slope: {slope:0.6f} mm/sample")
-        self.l_p2p.config(text=f"Peak-to-peak: {p2p:0.4f} mm")
-        self.l_score.config(text=f"Risk score: {score:0.1f}/100")
+        # self.l_slope.config(text=f"Slope: {slope:0.6f} in/sample")
+        # self.l_p2p.config(text=f"Peak-to-peak: {p2p:0.4f} in")
+        # self.l_score.config(text=f"Risk score: {score:0.1f}/100")
         self.chart.redraw()
         self.after(1000, self._tick)
 
@@ -1630,31 +1849,295 @@ class AnalysisPage(BasePage):
         self.headline("Modeling & Analysis")
 
         top = ttk.Frame(self); top.grid(row=1, column=0, sticky="ew", pady=(0,8))
-        ttk.Button(top, text="Compute from current data", command=self.render).grid(row=0, column=0, sticky="w")
         self.status_lbl = ttk.Label(top, text="", foreground="#6B7280")
-        self.status_lbl.grid(row=0, column=1, sticky="w", padx=12)
+        self.status_lbl.grid(row=0, column=0, sticky="w", padx=12)
 
-        self.fig = None
-        self.canvas_widget = None
-        area = ttk.Frame(self); area.grid(row=2, column=0, sticky="nsew")
-        self.rowconfigure(2, weight=1); self.columnconfigure(0, weight=1)
-        self.canvas_container = area
+        # --- where you currently have:
+        # area = ttk.Frame(self); area.grid(row=2, column=0, sticky="nsew")
+        # self.rowconfigure(2, weight=1); self.columnconfigure(0, weight=1)
+        #
+        # self.fig ... self.canvas.get_tk_widget().pack(...)
+        # self.fft_fig ... self.fft_canvas.get_tk_widget().pack(...)
 
-    def render(self):
-        if not DATA.od or len(DATA.od) < 400:
-            self.status_lbl.config(text="Load a CSV with at least a few hundred samples.")
+        # --- parent area -------------------------------------------------
+        area = ttk.Frame(self)
+        area.grid(row=2, column=0, sticky="nsew")
+        self.rowconfigure(2, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        # keep a handle for later
+        self._area = area
+
+        # DEFAULT: FFT not in use -> top 80% / FFT 20%
+        area.rowconfigure(0, weight=8)   # top plot
+        area.rowconfigure(1, weight=2)   # fft plot
+        area.columnconfigure(0, weight=1)
+
+        # --- layout controls (small toolbar above the plots) ---
+        controls = ttk.Frame(self)
+        controls.grid(row=1, column=0, sticky="ew", padx=(0, 0), pady=(0, 6))
+        ttk.Label(controls, text="Layout:").pack(side="left", padx=(0,6))
+
+        self._fft_in_use = tk.BooleanVar(value=False)  # default: FFT not in use
+        ttk.Checkbutton(
+            controls, text="FFT in use",
+            variable=self._fft_in_use,
+            command=lambda: self._apply_20_80()
+        ).pack(side="left")
+
+
+        # --- TOP PLOT (confidence timeline) -----------------------------
+        self.top_plot_frame = ttk.Frame(area)
+        self.top_plot_frame.grid(row=0, column=0, sticky="nsew")
+        self.top_plot_frame.columnconfigure(0, weight=1)
+        self.top_plot_frame.rowconfigure(0, weight=1)
+
+        self.fig = Figure(figsize=(10, 4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.top_plot_frame)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")   # <-- grid, not pack
+
+        self._overlay_images = []
+        self.ax.text(0.5, 0.5, "Load data and select a model to see predictions",
+                    ha="center", va="center", fontsize=12, color='#6B7280')
+        self.ax.axis("off")
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+        # --- FFT PLOT (bottom) ------------------------------------------
+        self.fft_plot_frame = ttk.Frame(area)
+        self.fft_plot_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.fft_plot_frame.columnconfigure(0, weight=1)
+        self.fft_plot_frame.rowconfigure(0, weight=1)
+
+        self.fft_fig = Figure(figsize=(10, 3), dpi=100)
+        self.fft_ax = self.fft_fig.add_subplot(111)
+        self.fft_canvas = FigureCanvasTkAgg(self.fft_fig, master=self.fft_plot_frame)
+        self.fft_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")  # <-- grid, not pack
+
+        self.fft_ax.text(0.5, 0.5, "FFT of latest window will appear here",
+                        ha="center", va="center", fontsize=11, color="#6B7280")
+        self.fft_ax.set_axis_off()
+        self.fft_fig.tight_layout()
+        self.fft_canvas.draw()
+
+
+
+
+    def _apply_20_80(self):
+        """Enforce 20/80 vertical split depending on whether FFT is 'in use'."""
+        fft_in_use = bool(self._fft_in_use.get())
+        # when FFT is in use -> bottom (FFT) gets 80%, top gets 20%
+        if fft_in_use:
+            self._area.rowconfigure(0, weight=2)  # top ~20%
+            self._area.rowconfigure(1, weight=8)  # fft ~80%
+            # make sure FFT frame is shown
+            try: self.fft_plot_frame.grid()   # no-op if already shown
+            except Exception: pass
+        else:
+            self._area.rowconfigure(0, weight=1)
+            self._area.rowconfigure(1, weight=0)
+            self.fft_plot_frame.grid_remove()
+            # keep FFT frame visible so the 20% placeholder remains
+            # (if you prefer to hide it entirely, call grid_remove() here instead)
+        # nudge canvases to reflow
+        try:
+            self.canvas.draw_idle()
+            self.fft_canvas.draw_idle()
+        except Exception:
+            pass
+
+
+    def _tick_fft(self):
+        # update FFT plot even if no model is selected
+        self.update_fft_plot(n=24000)
+        self.after(1500, self._tick_fft)
+
+    def update_confidence_timeline(self):
+        if not DATA.od:
+            messagebox.showinfo("No Data", "Please load data first")
             return
-        fe = FeatureEngine(np.array(DATA.od), window=30, fs=1.0)
-        fig = fe.fig_sixpack()
 
-        if self.canvas_widget:
-            self.canvas_widget.get_tk_widget().destroy()
-        self.fig = fig
-        canvas = FigureCanvasTkAgg(fig, master=self.canvas_container)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-        self.canvas_widget = canvas
-        self.status_lbl.config(text="Analysis updated.")
+        if DATA.model is None:
+            messagebox.showinfo("No Model", "Please select a model first.")
+            return
+
+        App.status("Computing confidence timeline.")
+
+        self._overlay_images.clear()
+        self.ax.clear()
+
+        ws = DATA.window_size
+        num_windows = len(DATA.od) // ws
+
+        if num_windows < 1:
+            self.ax.text(0.5, 0.5, "Not enough data for the selected window size",
+                         ha="center", va="center", fontsize=12)
+            self.ax.axis("off")
+            self.canvas.draw()
+            return
+
+        confidences = []
+        window_times = []
+
+        if not DATA.ts_dt:
+            DATA.ts_dt = pd.to_datetime(DATA.ts, errors='coerce').tolist()
+            if not DATA.ts_dt or all(pd.isna(t) for t in DATA.ts_dt):
+                DATA.ts_dt = [pd.Timestamp.now() + pd.Timedelta(seconds=i) for i in range(len(DATA.od))]
+
+        for i in range(num_windows):
+            start_idx = i * ws
+            end_idx = start_idx + ws
+            if end_idx > len(DATA.od):
+                break
+
+            window = DATA.od[start_idx:end_idx]
+            features_dict = DATA.extract_features(window)
+            X = pd.DataFrame([features_dict])
+            probas = DATA.model.predict_proba(X)
+            confidences.append(probas[0, 1] * 100)
+
+            # use timestamp at center of window for x-axis
+            mid_idx = start_idx + ws // 2
+            if mid_idx < len(DATA.ts_dt):
+                window_times.append(DATA.ts_dt[mid_idx])
+            else:
+                window_times.append(DATA.ts_dt[-1])
+
+        if not confidences:
+            self.ax.text(0.5, 0.5, "Not enough data to compute timeline",
+                         ha="center", va="center", fontsize=12)
+            self.ax.axis("off")
+            self.canvas.draw()
+            return
+
+        self.ax.plot(window_times, confidences, label="Chatter likelihood", color="#2563EB", linewidth=2)
+
+        # shaded class bands, if any
+        for span in getattr(DATA, "classes", []):
+            label = span.get("label", "UNCERTAIN")
+            color = CLASS_COLORS.get(label, "#BBBBBB")
+            start_time = span.get("start")
+            end_time = span.get("end")
+            if start_time is None or end_time is None:
+                continue
+            self.ax.axvspan(start_time, end_time,
+                            facecolor=pastel(color, 0.25),
+                            alpha=0.25,
+                            linewidth=0, zorder=0)
+
+        self.ax.set_xlabel('Time', fontsize=11)
+        self.ax.set_ylabel('Chatter Likelihood (%)', fontsize=11)
+        self.ax.set_title(f'Chatter Confidence in each Window over Time (Window Size: {ws} samples)',
+                          fontsize=12, fontweight='bold')
+        self.ax.grid(True, alpha=0.3, zorder=0)
+        self.ax.set_ylim([0, 105])
+
+        # Legend for line + class colors
+        handles, labels = self.ax.get_legend_handles_labels()
+        from matplotlib.patches import Patch
+        for name, color in CLASS_COLORS.items():
+            if name in VISIBLE_CLASSES:
+                handles.append(Patch(facecolor=pastel(color, 0.25), label=name))
+                labels.append(name)
+        self.ax.legend(handles, labels, loc="upper right", fontsize=8)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+        self.status_lbl.config(text=f"Timeline updated: {len(confidences)} windows analyzed")
+        App.status(f"Confidence timeline computed for {len(confidences)} windows")
+
+    def update_fft_plot(self, n=512):
+        """
+        Plot FFT of the latest n OD samples in the bottom chart.
+        Shows 'inconclusive' style messages if there is not enough data or no clear peak.
+        """
+        self.fft_ax.clear()
+
+        if not DATA.od:
+            self.fft_ax.text(0.5, 0.5, "No data loaded",
+                             ha="center", va="center", fontsize=11)
+            self.fft_ax.set_axis_off()
+            self.fft_fig.tight_layout()
+            self.fft_canvas.draw()
+            return
+
+        y = np.asarray(DATA.recent_window(n), dtype=float)
+        if y.size < 16:
+            self.fft_ax.text(0.5, 0.5, "Not enough samples for FFT",
+                             ha="center", va="center", fontsize=11)
+            self.fft_ax.set_axis_off()
+            self.fft_fig.tight_layout()
+            self.fft_canvas.draw()
+            return
+
+        y = y - np.mean(y)
+        if not np.any(np.isfinite(y)) or np.allclose(y, 0.0, atol=1e-12):
+            self.fft_ax.text(0.5, 0.5, "FFT inconclusive (flat signal)",
+                             ha="center", va="center", fontsize=11)
+            self.fft_ax.set_axis_off()
+            self.fft_fig.tight_layout()
+            self.fft_canvas.draw()
+            return
+
+        # Estimate sampling rate from OD timestamps (fallback to 1 Hz)
+        fs = 1.0
+        try:
+            if DATA.ts_dt and len(DATA.ts_dt) >= len(y):
+                t = pd.to_datetime(DATA.ts_dt[-len(y):], errors="coerce")
+                t = t[~pd.isna(t)]
+                if len(t) >= 2:
+                    dt_sec = np.median(
+                        np.diff(t).astype("timedelta64[ns]").astype(np.float64)
+                    ) / 1e9
+                    if dt_sec > 0:
+                        fs = 1.0 / dt_sec
+        except Exception:
+            pass
+
+        nfft = len(y)
+        freqs = np.fft.rfftfreq(nfft, d=1.0/fs)
+        fft_vals = np.fft.rfft(y)
+        psd = (np.abs(fft_vals)**2) / nfft
+
+        if psd.size <= 1:
+            self.fft_ax.text(0.5, 0.5, "FFT inconclusive",
+                             ha="center", va="center", fontsize=11)
+            self.fft_ax.set_axis_off()
+            self.fft_fig.tight_layout()
+            self.fft_canvas.draw()
+            return
+
+        # Ignore DC bin when plotting and measuring
+        freqs_plot = freqs[1:]
+        psd_plot = psd[1:]
+
+        self.fft_ax.plot(freqs_plot, psd_plot)
+        self.fft_ax.set_xlabel("Frequency (Hz)")
+        self.fft_ax.set_ylabel("Power")
+        self.fft_ax.set_title("FFT of Latest Window")
+        self.fft_ax.grid(True, alpha=0.3)
+        self.fft_ax.set_axis_on()
+
+        # Highlight dominant frequency if clearly periodic
+        peak_idx = int(np.argmax(psd_plot))
+        peak_freq = float(freqs_plot[peak_idx])
+        peak_power = float(psd_plot[peak_idx])
+        total_power = float(np.sum(psd_plot))
+        prominence = peak_power / total_power if total_power > 0 else 0.0
+
+        if total_power > 0 and prominence > 0.30:
+            self.fft_ax.axvline(peak_freq, linestyle="--", alpha=0.7)
+            self.fft_ax.text(
+                peak_freq, peak_power,
+                f"{peak_freq:.3g} Hz",
+                rotation=90, va="bottom", ha="right", fontsize=9
+            )
+
+        self.fft_fig.tight_layout()
+        self.fft_canvas.draw()
+
 
 class CorrelationWindow(tk.Toplevel):
     def __init__(self, parent):
@@ -1667,7 +2150,6 @@ class CorrelationWindow(tk.Toplevel):
             return
 
         # === Top stats / controls ===
-        # === Top stats / controls ===
         top = ttk.Frame(self, padding=12)
         top.pack(side="top", fill="x")
 
@@ -1678,36 +2160,19 @@ class CorrelationWindow(tk.Toplevel):
 
         ttk.Label(top, text=f"Paired rows: {stats['n']}", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0,20))
         ttk.Label(top, text=rtxt).grid(row=0, column=1, sticky="w", padx=(0,20))
-        ttk.Label(top, text=f"Tendency: {sign}", foreground=color, font=("Segoe UI", 10, "bold")).grid(row=0, column=2, sticky="w")
+        badge = ttk.Label(top, text=f"Tendency: {sign}", foreground=color, font=("Segoe UI", 10, "bold"))
+        badge.grid(row=0, column=2, sticky="w")
 
-        # ---- controls row (MAKE ctrl BEFORE using it) ----
+        # Controls
         ctrl = ttk.Frame(top)
         ctrl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8,0))
-
         ttk.Label(ctrl, text="Max lag (samples):").grid(row=0, column=0, sticky="w")
         self.maxlag_var = tk.IntVar(value=300)
         ttk.Entry(ctrl, textvariable=self.maxlag_var, width=8).grid(row=0, column=1, sticky="w", padx=(6,16))
-
         ttk.Label(ctrl, text="Rolling window (samples):").grid(row=0, column=2, sticky="w")
         self.win_var = tk.IntVar(value=200)
         ttk.Entry(ctrl, textvariable=self.win_var, width=8).grid(row=0, column=3, sticky="w", padx=(6,16))
-
         ttk.Button(ctrl, text="Update plots", command=self._refresh_all).grid(row=0, column=4)
-
-        # ---- stack order selector ----
-        ttk.Label(ctrl, text="Stack order:").grid(row=0, column=5, sticky="w", padx=(16,6))
-        self.stack_var = tk.StringVar(value="OD on top")
-        ttk.Combobox(
-            ctrl,
-            state="readonly",
-            width=16,
-            textvariable=self.stack_var,
-            values=["OD on top", "Secondary on top"]
-        ).grid(row=0, column=6, sticky="w")
-
-        # apply on change
-        self.stack_var.trace_add("write", lambda *_: self._apply_stack_order())
-
 
         # === Tabs ===
         nb = ttk.Notebook(self)
@@ -1718,13 +2183,11 @@ class CorrelationWindow(tk.Toplevel):
         self.tab_lag     = ttk.Frame(nb); nb.add(self.tab_lag,     text="Corr vs Lag")
         self.tab_roll    = ttk.Frame(nb); nb.add(self.tab_roll,    text="Rolling Corr")
 
-        # === Figures & canvases (create after tabs) ===
+        # Matplotlib canvases
         self.fig_overlay = Figure(figsize=(7.5, 4.5), dpi=100)
         self.ax_overlay  = self.fig_overlay.add_subplot(111)
         self.cv_overlay  = FigureCanvasTkAgg(self.fig_overlay, master=self.tab_overlay)
         self.cv_overlay.get_tk_widget().pack(fill="both", expand=True)
-        self.tb_overlay  = NavigationToolbar2Tk(self.cv_overlay, self.tab_overlay)
-        self.tb_overlay.update()
 
         self.fig_scatter = Figure(figsize=(7.5, 4.5), dpi=100)
         self.ax_scatter  = self.fig_scatter.add_subplot(111)
@@ -1741,31 +2204,7 @@ class CorrelationWindow(tk.Toplevel):
         self.cv_roll  = FigureCanvasTkAgg(self.fig_roll, master=self.tab_roll)
         self.cv_roll.get_tk_widget().pack(fill="both", expand=True)
 
-        # Wire legend/line picker once
-        self._overlay_pickers_wired = False
-
         self._refresh_all()
-
-    def _apply_stack_order(self):
-        # Only after lines exist
-        if not hasattr(self, "_od_line_overlay") or not hasattr(self, "_sec_line_overlay"):
-            return
-
-        if self.stack_var.get() == "OD on top":
-            self._sec_line_overlay.set_zorder(2)
-            self._od_line_overlay.set_zorder(3)
-        else:
-            self._od_line_overlay.set_zorder(2)
-            self._sec_line_overlay.set_zorder(3)
-
-        # Rebuild legend so it stays in sync & pickable
-        leg = self.ax_overlay.legend(loc="upper right")
-        for legline, orig in zip(leg.get_lines(), (self._od_line_overlay, self._sec_line_overlay)):
-            legline.set_picker(True)
-            legline._linked_line = orig
-
-        self.cv_overlay.draw_idle()
-
 
     # ---- drawing helpers ----
     def _refresh_all(self):
@@ -1781,38 +2220,14 @@ class CorrelationWindow(tk.Toplevel):
 
         self.ax_overlay.clear()
         t = pd.to_datetime(df["t"], errors="coerce")
-        self._t_full = t            # save for sliders
-        self._t0 = t.iloc[0] if len(t) else None
-        self._t1 = t.iloc[-1] if len(t) else None
-
-        # Plot and keep references
-        (self._od_line_overlay,)  = self.ax_overlay.plot(
-            t, df["od_z"],  linewidth=1.8, label="OD (z-score)", zorder=2, picker=5
-        )
-        (self._sec_line_overlay,) = self.ax_overlay.plot(
-            t, df["sec_z"], linewidth=1.8, label="Secondary (z-score)", zorder=1, picker=5
-        )
+        self.ax_overlay.plot(t, df["od_z"],  linewidth=1.5, label="OD (z-score)")
+        self.ax_overlay.plot(t, df["sec_z"], linewidth=1.5, label="Secondary (z-score)")
         self.ax_overlay.axhline(0, linewidth=0.8, color="#999999")
         self.ax_overlay.set_title("Time Overlay (z-scored)")
         self.ax_overlay.set_xlabel("time"); self.ax_overlay.set_ylabel("z-score")
-
-        # Legend that toggles visibility
-        leg = self.ax_overlay.legend(loc="upper right")
-        # make legend proxy lines pickable and remember their target line
-        for legline, orig in zip(leg.get_lines(), (self._od_line_overlay, self._sec_line_overlay)):
-            legline.set_picker(True)
-            legline._linked_line = orig
-
+        self.ax_overlay.legend(loc="upper right")
         self.fig_overlay.tight_layout()
         self.cv_overlay.draw()
-        # ... after creating self._od_line_overlay and self._sec_line_overlay and legend wiring
-        self._apply_stack_order()   # <-- ensure chosen order is applied after every redraw
-
-
-        # only connect once
-        if not hasattr(self, "_overlay_pickers_wired"):
-            self._overlay_pickers_wired = True
-            self.cv_overlay.mpl_connect("pick_event", self._on_pick_overlay)
 
     def _draw_scatter(self):
         df = DATA.paired_df
@@ -1872,61 +2287,6 @@ class CorrelationWindow(tk.Toplevel):
             self.ax_roll.axis("off")
         self.fig_roll.tight_layout()
         self.cv_roll.draw()
-    def _plot_time_overlay(self):
-        df = DATA.paired_df.copy()
-        df["z_od"]  = (df["od"]  - df["od"].mean())  / (df["od"].std(ddof=0)  + 1e-9)
-        df["z_sec"] = (df["sec"] - df["sec"].mean()) / (df["sec"].std(ddof=0) + 1e-9)
-
-        self.ax.clear()
-        self._od_line,  = self.ax.plot(df["t"], df["z_od"],  label="OD (z-score)",
-                                       lw=1.5, alpha=0.9, zorder=2, picker=5)
-        self._sec_line, = self.ax.plot(df["t"], df["z_sec"], label="Secondary (z-score)",
-                                       lw=1.5, alpha=0.9, zorder=1, picker=5)
-
-        leg = self.ax.legend(loc="upper left")
-        # make legend entries clickable to toggle visibility
-        for legline, orig in zip(leg.get_lines(), [self._od_line, self._sec_line]):
-            legline.set_picker(True)
-            legline._linked_line = orig
-
-        self.ax.set_title("Time Overlay (z-scored)")
-        self.ax.set_ylabel("z-score"); self.ax.set_xlabel("time")
-        self.fig.tight_layout()
-        self.canvas.draw()
-    def _on_pick_overlay(self, event):
-        artist = event.artist
-
-        # Clicking a legend entry toggles its linked line
-        linked = getattr(artist, "_linked_line", None)
-        if linked is not None:
-            vis = not linked.get_visible()
-            linked.set_visible(vis)
-            # dim legend item when hidden
-            try:
-                artist.set_alpha(1.0 if vis else 0.25)
-            except Exception:
-                pass
-            self.cv_overlay.draw_idle()
-            return
-
-        # Clicking a line brings it to front
-        if artist in (getattr(self, "_od_line_overlay", None), getattr(self, "_sec_line_overlay", None)):
-            # lower both, then raise clicked one
-            for ln in (self._od_line_overlay, self._sec_line_overlay):
-                ln.set_zorder(1)
-            artist.set_zorder(3)
-            self.cv_overlay.draw_idle()
-
-
-    # click legend entry -> toggle visibility
-    def _on_pick_legend(self, event):
-        legline = event.artist
-        linked  = getattr(legline, "_linked_line", None)
-        if linked is None: return
-        vis = not linked.get_visible()
-        linked.set_visible(vis)
-        legline.set_alpha(1.0 if vis else 0.25)
-        self.canvas.draw_idle()
 
 
 
@@ -1937,7 +2297,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1280x800"); self.minsize(1120, 720)
+        self.geometry("1400x850"); self.minsize(1120, 720)
 
         self._init_style(); self._init_menu()
 
@@ -1950,6 +2310,7 @@ class App(tk.Tk):
 
         self.pages = {
             "Data": DataPage(self.container),
+            "Model": ModelPage(self.container),
             "Results": ResultsPage(self.container),
             "History": HistoryPage(self.container),
             "Analysis": AnalysisPage(self.container),
@@ -1978,7 +2339,6 @@ class App(tk.Tk):
     def _init_menu(self):
         menubar = tk.Menu(self)
         filemenu = tk.Menu(menubar, tearoff=0)
-        filemenu.add_command(label="Open Project in VS Code", command=lambda: open_in_vscode(os.path.abspath(".")))
         filemenu.add_separator(); filemenu.add_command(label="Exit", command=self.destroy)
         menubar.add_cascade(label="File", menu=filemenu)
         self.config(menu=menubar)
@@ -1987,7 +2347,7 @@ class App(tk.Tk):
         bar = ttk.Frame(parent, style="Sidebar.TFrame", padding=12)
         ttk.Label(bar, text="Wavy Detection", foreground="white", background="#111827",
                   font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0,16))
-        for name, accel in [("Data","Ctrl+1"),("Results","Ctrl+2"),("History","Ctrl+3"),("Analysis","Ctrl+4")]:
+        for name, accel in [("Data","Ctrl+1"),("Model","Ctrl+2"),("Results","Ctrl+3"),("History","Ctrl+4"),("Analysis","Ctrl+5")]:
             ttk.Button(bar, text=f"{name}    ({accel})", style="Sidebar.TButton",
                        command=lambda n=name: self.show(n)).pack(fill="x", pady=6)
         ttk.Label(bar, text="", background="#111827").pack(expand=True, fill="both")
