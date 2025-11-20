@@ -11,19 +11,19 @@ import websockets
 fs = 2400.0                  # websocket sample rate [Hz]
 dt_target = 1.0 / fs        # target time step [s]
 
-mean_od_mm = 12.7           # target OD
-drift_per_ft_mm = 0.000001     # slow drift per foot
+mean_od = 12.7           # target OD [inches]
+drift_per_ft = 0.000001     # slow drift per foot
 
 # Chatter patterns (spatial) along the tube
-chatter_wavelengths_in = [0.5, 2.0, 1.0]  # inches
-chatter_amps_mm = [0.05, 0.02, 0.1]       # mm
+chatter_wavelengths = [0.5, 2.0, 1.0] # [inches]
+chatter_amps = [0.05, 0.02, 0.1] # [inches]
 
-noise_std_running = 0.005   # noise when line is moving [mm]
-noise_std_stopped = 0.0005  # noise when line is stopped [mm]
+noise_std_running = 0.005   # noise when line is moving [inches]
+noise_std_stopped = 0.0005  # noise when line is stopped [inches]
 
 # Random segment behavior (real time)
-MIN_SEG_DURATION_S = 5.0
-MAX_SEG_DURATION_S = 20.0
+MIN_SEG_DURATION = 5.0      # [s]
+MAX_SEG_DURATION = 20.0     # [s]
 
 RUN_SPEED_MIN_FPM = 120.0
 RUN_SPEED_MAX_FPM = 220.0
@@ -32,7 +32,7 @@ RUN_SPEED_JITTER_STD = 3.0  # small jitter around the "constant" speed
 
 def sample_segment_duration():
     """Random segment length in seconds."""
-    return random.uniform(MIN_SEG_DURATION_S, MAX_SEG_DURATION_S)
+    return random.uniform(MIN_SEG_DURATION, MAX_SEG_DURATION)
 
 
 def sample_run_speed():
@@ -77,7 +77,7 @@ async def simulation_loop():
 
     # Physical state
     length_in = 0.0  # cumulative length [in]
-    phases = np.zeros(len(chatter_wavelengths_in), dtype=float)
+    phases = np.zeros(len(chatter_wavelengths), dtype=float)
 
     try:
         while True:
@@ -119,22 +119,22 @@ async def simulation_loop():
             length_ft = length_in / 12.0
 
             # Base OD = mean + drift
-            od_mm = mean_od_mm + drift_per_ft_mm * length_ft
+            od = mean_od + drift_per_ft * length_ft
 
             # Add chatter components via phase accumulation
-            for i, (lam_in, amp_mm) in enumerate(
-                zip(chatter_wavelengths_in, chatter_amps_mm)
+            for i, (lam_in, amp_in) in enumerate(
+                zip(chatter_wavelengths, chatter_amps)
             ):
                 if lam_in > 0:
                     freq_hz = speed_in_s / lam_in  # f = v / λ
                 else:
                     freq_hz = 0.0
                 phases[i] += 2.0 * np.pi * freq_hz * dt
-                od_mm += amp_mm * np.sin(phases[i])
+                od += amp_in * np.sin(phases[i])
 
             # Add noise, lower when stopped
             noise_std = noise_std_running if current_speed_fpm > 0.0 else noise_std_stopped
-            od_mm += random.gauss(0.0, noise_std)
+            od += random.gauss(0.0, noise_std)
 
             # Real-time timestamp
             current_time = datetime.now(timezone.utc)
@@ -142,7 +142,7 @@ async def simulation_loop():
 
             msg = {
                 "t_stamp": ts_str,
-                "od": float(od_mm),
+                "od": float(od),
                 "speed": float(current_speed_fpm),
             }
 
