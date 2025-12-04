@@ -593,25 +593,74 @@ class DataStore:
         App.status(f"Classes from features loaded: {len(self.classes)} spans.")
 
     def extract_features(self, window_data):
-        mean_val = np.mean(window_data)
-        std_val = np.std(window_data)
-        # div by zero
-        if mean_val == 0:
-            mean_val = 1e-10
-        
-        # features are normalized to the mean here to take into account spans of multiple different tubing target sizes
+        window_data = np.asarray(window_data, dtype=float)
+        mean_val = float(np.mean(window_data))
+        std_val = float(np.std(window_data))
+        ptp_val = float(np.ptp(window_data))
+
+        safe_mean = mean_val if mean_val != 0 else 1e-10
+
         features = {
-            'coef_variation': std_val / mean_val,  # coefficient of variation ak relative std
-            'relative_range': np.ptp(window_data) / mean_val,  # range relative to mean
-            'normalized_variance': np.var(window_data) / (mean_val ** 2),
-            'peak_to_peak_ratio': np.ptp(window_data) / np.abs(mean_val),
-            'relative_max_deviation': (np.max(window_data) - mean_val) / mean_val,
-            'relative_min_deviation': (mean_val - np.min(window_data)) / mean_val,
-            # differences between consecutive points, indicates smoothness
-            'mean_abs_diff': np.mean(np.abs(np.diff(window_data))) / mean_val,
-            'max_abs_diff': np.max(np.abs(np.diff(window_data))) / mean_val,
+            # absolute scale
+            "mean_od": mean_val,
+            "std_abs": std_val,
+            "range_abs": ptp_val,
+            # relative-to-mean scale
+            "coef_variation": std_val / safe_mean,
+            "relative_range": ptp_val / safe_mean,
+            "normalized_variance": float(np.var(window_data)) / (safe_mean ** 2),
+            "peak_to_peak_ratio": ptp_val / abs(safe_mean),
+            "relative_max_deviation": (float(np.max(window_data)) - mean_val) / safe_mean,
+            "relative_min_deviation": (mean_val - float(np.min(window_data))) / safe_mean,
+            "mean_abs_diff": float(np.mean(np.abs(np.diff(window_data)))) / safe_mean,
+            "max_abs_diff": float(np.max(np.abs(np.diff(window_data)))) / safe_mean,
         }
-        
+
+        # estimate sampling frequ
+        fs = 2400.0
+        try:
+            if self.ts_dt and len(self.ts_dt) >= n:
+                t = pd.to_datetime(self.ts_dt[-n:], errors="coerce")
+                t = t[~pd.isna(t)]
+                if len(t) >= 2:
+                    dt_sec = np.median(
+                        np.diff(t).astype("timedelta64[ns]").astype(np.float64)
+                    ) / 1e9
+                    if dt_sec > 0:
+                        fs = float(1.0 / dt_sec)
+        except Exception:
+            pass
+
+        # ---- FFT features ----
+        fft_valid = 0
+        fft_peak_freq = 0.0
+        fft_peak_prominence = 0.0
+
+        y = window_data - mean_val
+        if len(y) >= 16 and not np.allclose(y, 0.0, atol=1e-12):
+            nfft = len(y)
+            freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+            fft_vals = np.fft.rfft(y)
+            psd = (np.abs(fft_vals) ** 2) / nfft
+
+            if psd.size > 1 and np.any(np.isfinite(psd)):
+                psd_no_dc = psd[1:]
+                freqs_no_dc = freqs[1:]
+                total_power = float(np.sum(psd_no_dc))
+
+                if total_power > 0:
+                    peak_idx = int(np.argmax(psd_no_dc))
+                    peak_power = float(psd_no_dc[peak_idx])
+                    fft_peak_freq = float(freqs_no_dc[peak_idx])
+                    fft_peak_prominence = peak_power / total_power
+
+                    if fft_peak_prominence > 0.30:
+                        fft_valid = 1
+
+        features["fft_valid"] = fft_valid
+        features["fft_peak_freq"] = fft_peak_freq
+        features["fft_peak_prominence"] = fft_peak_prominence
+
         return features
     
     def get_label_from_risk_prob(self, risk):
@@ -1597,8 +1646,8 @@ class LiveTimeSeries(ttk.Frame):
                 self.ax.axvspan(i0, i1, facecolor=c, alpha=0.25, linewidth=0)
                 
                 # Add label text on the overlay
-                self.ax.text(i0 + 2, self.ax.get_ylim()[1] * 0.95, seg["label"], 
-                           fontsize=8, color='#333333', weight='bold')
+                # self.ax.text(i0 + 2, self.ax.get_ylim()[1] * 0.95, seg["label"], 
+                #            fontsize=8, color='#333333', weight='bold')
 
         self.ax.set_title("OD vs Samples — live")
         self.ax.set_xlabel("sample index")
